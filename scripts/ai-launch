@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""Unified AI agent launcher for tmux with git worktree isolation."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# ── Constants ────────────────────────────────────────────────────
+
+DEFAULT_PATH_SEGMENTS = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+]
+SELF_PATH = Path(__file__).resolve()
+
+
+# ── Shared Utilities ─────────────────────────────────────────────
+
+
+def pause_for_window() -> None:
+    try:
+        print("")
+        input("Press Enter to close...")
+    except EOFError:
+        pass
+
+
+def die(message: str, *, exit_code: int = 1) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    pause_for_window()
+    raise SystemExit(exit_code)
+
+
+def ensure_reasonable_path() -> None:
+    current = os.environ.get("PATH", "")
+    parts = [part for part in current.split(":") if part]
+    for segment in DEFAULT_PATH_SEGMENTS:
+        if segment not in parts:
+            parts.append(segment)
+    os.environ["PATH"] = ":".join(parts)
+
+
+def require_dependency(command: str) -> None:
+    if shutil.which(command) is None:
+        raise RuntimeError(f"'{command}' is required but not found in PATH")
+
+
+def run_capture(
+    command: list[str], *, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command, capture_output=True, text=True, check=False, cwd=cwd
+    )
+
+
+def git_value(path: Path, args: list[str]) -> str:
+    result = run_capture(["git", "-C", str(path), *args])
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {details}")
+    value = result.stdout.strip()
+    if not value:
+        raise RuntimeError(f"git {' '.join(args)} returned an empty value")
+    return value
+
+
+def git_status_porcelain(path: Path) -> str:
+    result = run_capture(["git", "-C", str(path), "status", "--porcelain"])
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"git status failed in {path}: {details}")
+    return result.stdout
+
+
+def resolve_repo_root(start_dir: Path) -> Path:
+    root_text = git_value(start_dir, ["rev-parse", "--show-toplevel"])
+    root = Path(root_text).resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"Resolved repo root is not a directory: {root}")
+    return root
+
+
+def tmux_value(format_string: str) -> str:
+    result = run_capture(["tmux", "display-message", "-p", format_string])
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"tmux display-message failed: {details}")
+    value = result.stdout.strip()
+    if not value:
+        raise RuntimeError(
+            f"tmux returned an empty value for format: {format_string}"
+        )
+    return value
+
+
+# ── Worktree Management ─────────────────────────────────────────
+
+
+def slugify(name: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", name.strip())
+    slug = slug.strip("-._")
+    return slug or "ai"
+
+
+def make_worktree_identity(
+    name: str, repo_root: Path
+) -> tuple[str, Path]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = slugify(name)
+    branch_name = f"ai/{slug}-{timestamp}"
+    worktrees_dir = repo_root / ".worktrees"
+    worktree_path = worktrees_dir / f"{slug}-{timestamp}"
+    return branch_name, worktree_path
+
+
+def create_worktree(
+    repo_root: Path,
+    target_revision: str,
+    branch_name: str,
+    worktree_path: Path,
+) -> None:
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    result = run_capture(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "worktree",
+            "add",
+            "-b",
+            branch_name,
+            str(worktree_path),
+            target_revision,
+        ]
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"failed to create worktree: {details}")
+
+
+def resolve_agent_cwd(
+    repo_root: Path, launch_dir: Path, worktree_path: Path
+) -> Path:
+    try:
+        relative = launch_dir.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return worktree_path
+    candidate = worktree_path / relative
+    if candidate.is_dir():
+        return candidate
+    return worktree_path
+
+
+def cleanup_worktree(
+    repo_root: Path, worktree_path: Path, branch_name: str
+) -> list[str]:
+    warnings: list[str] = []
+    remove_result = run_capture(
+        ["git", "-C", str(repo_root), "worktree", "remove", str(worktree_path)]
+    )
+    if remove_result.returncode != 0:
+        details = (remove_result.stderr or remove_result.stdout).strip()
+        warnings.append(f"Could not remove worktree {worktree_path}: {details}")
+    delete_result = run_capture(
+        ["git", "-C", str(repo_root), "branch", "-D", branch_name]
+    )
+    if delete_result.returncode != 0:
+        details = (delete_result.stderr or delete_result.stdout).strip()
+        warnings.append(f"Could not delete branch {branch_name}: {details}")
+    return warnings
+
+
+# ── Agent Execution ──────────────────────────────────────────────
+
+
+def run_agent_interactive(agent: str, cwd: Path) -> int:
+    if agent == "claude":
+        cmd = ["claude", "--dangerously-skip-permissions"]
+    elif agent == "codex":
+        cmd = ["codex", "--full-auto"]
+    else:
+        cmd = ["bash", "-c", agent]
+    result = subprocess.run(cmd, cwd=cwd, check=False)
+    return result.returncode
+
+
+def run_agent_todo(agent: str, todo_path: Path, cwd: Path) -> int:
+    print(f"Running {agent} in: {cwd}")
+    print(f"Todo file: {todo_path}")
+    print("")
+    if agent == "codex":
+        with todo_path.open("r", encoding="utf-8") as fh:
+            result = subprocess.run(
+                [
+                    "codex",
+                    "exec",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-",
+                ],
+                cwd=cwd,
+                stdin=fh,
+                check=False,
+            )
+    elif agent == "claude":
+        todo_content = todo_path.read_text(encoding="utf-8")
+        result = subprocess.run(
+            [
+                "claude",
+                "--dangerously-skip-permissions",
+                "-p",
+                todo_content,
+            ],
+            cwd=cwd,
+            check=False,
+        )
+    else:
+        with todo_path.open("r", encoding="utf-8") as fh:
+            result = subprocess.run(
+                ["bash", "-c", agent],
+                cwd=cwd,
+                stdin=fh,
+                check=False,
+            )
+    return result.returncode
+
+
+# ── Merge Lifecycle ──────────────────────────────────────────────
+
+
+def show_summary(
+    worktree_path: Path,
+    branch_name: str,
+    target_branch: str,
+    agent_exit_code: int,
+) -> bool:
+    print("")
+    print("=" * 60)
+    print("Agent session complete")
+    print("=" * 60)
+    print(f"  Exit code:     {agent_exit_code}")
+    print(f"  Branch:        {branch_name}")
+    print(f"  Worktree:      {worktree_path}")
+    print(f"  Target branch: {target_branch}")
+
+    status = git_status_porcelain(worktree_path).strip()
+    if not status:
+        print("")
+        print("No changes were made.")
+        return False
+
+    diff_result = run_capture(
+        ["git", "-C", str(worktree_path), "diff", "--stat"]
+    )
+    untracked = [
+        line
+        for line in status.splitlines()
+        if line.startswith("??")
+    ]
+
+    print("")
+    print("Changes:")
+    if diff_result.stdout.strip():
+        print(diff_result.stdout.strip())
+    if untracked:
+        for line in untracked:
+            filepath = line[3:].strip()
+            print(f" {filepath} (new)")
+    return True
+
+
+def prompt_action(target_branch: str) -> str:
+    while True:
+        print("")
+        try:
+            answer = input(
+                f"Merge into {target_branch}? "
+                "[y]es / [n]o (keep worktree) / [d]iscard: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "keep"
+        if answer in ("y", "yes"):
+            return "merge"
+        if answer in ("n", "no"):
+            return "keep"
+        if answer in ("d", "discard"):
+            return "discard"
+        print("Please enter y, n, or d.")
+
+
+def prompt_cleanup() -> bool:
+    try:
+        answer = input("Clean up worktree and branch? [y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes")
+
+
+def commit_worktree_changes(worktree_path: Path, commit_message: str) -> None:
+    result = run_capture(["git", "-C", str(worktree_path), "add", "-A"])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to stage changes: {(result.stderr or result.stdout).strip()}"
+        )
+    result = run_capture(
+        ["git", "-C", str(worktree_path), "commit", "-m", commit_message]
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to commit changes: {(result.stderr or result.stdout).strip()}"
+        )
+
+
+def enforce_merge_gates(
+    repo_root: Path, target_branch: str, target_revision: str
+) -> tuple[bool, str]:
+    # Gate 1: target branch unchanged
+    try:
+        current_branch = git_value(
+            repo_root, ["symbolic-ref", "--quiet", "--short", "HEAD"]
+        )
+    except RuntimeError:
+        return False, "Cannot read current branch in primary worktree."
+    if current_branch != target_branch:
+        return (
+            False,
+            f"Branch changed: expected '{target_branch}', found '{current_branch}'.",
+        )
+
+    # Gate 2: target revision unchanged
+    try:
+        current_rev = git_value(repo_root, ["rev-parse", "HEAD"])
+    except RuntimeError:
+        return False, "Cannot read HEAD in primary worktree."
+    if current_rev != target_revision:
+        return (
+            False,
+            f"HEAD changed since launch: expected {target_revision[:12]}, "
+            f"found {current_rev[:12]}.",
+        )
+
+    # Gate 3: primary worktree clean
+    status = git_status_porcelain(repo_root).strip()
+    if status:
+        return False, f"Primary worktree is not clean:\n{status}"
+
+    return True, ""
+
+
+def merge_branch(repo_root: Path, branch_name: str) -> None:
+    result = run_capture(
+        ["git", "-C", str(repo_root), "merge", "--ff-only", branch_name]
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Fast-forward merge failed: {details}")
+
+
+def find_todos_root(todo_path: Path) -> Path:
+    for ancestor in todo_path.parents:
+        if ancestor.name == "todos":
+            return ancestor
+    return todo_path.parent
+
+
+def append_completion_footer(
+    archived_todo_path: Path,
+    commit_sha: str,
+    branch_name: str,
+    completion_timestamp: str,
+) -> None:
+    existing = archived_todo_path.read_text(encoding="utf-8")
+    separator = ""
+    if existing:
+        separator = "\n" if existing.endswith("\n") else "\n\n"
+    footer = "\n".join(
+        [
+            f"{separator}---",
+            "Completion:",
+            f"- Commit SHA: `{commit_sha}`",
+            f"- Branch: `{branch_name}`",
+            f"- Timestamp: `{completion_timestamp}`",
+            "",
+        ]
+    )
+    with archived_todo_path.open("a", encoding="utf-8") as fh:
+        fh.write(footer)
+
+
+def archive_todo(
+    todo_path: Path,
+    commit_sha: str,
+    branch_name: str,
+) -> Path:
+    completion_time = datetime.now()
+    completion_day = completion_time.strftime("%Y-%m-%d")
+    completion_timestamp = completion_time.isoformat(timespec="seconds")
+
+    done_dir = find_todos_root(todo_path) / "done" / completion_day
+    done_dir.mkdir(parents=True, exist_ok=True)
+
+    archived_todo_path = done_dir / todo_path.name
+    if archived_todo_path.exists():
+        raise RuntimeError(
+            f"Archive destination already exists: {archived_todo_path}"
+        )
+
+    shutil.move(str(todo_path), str(archived_todo_path))
+    append_completion_footer(
+        archived_todo_path, commit_sha, branch_name, completion_timestamp
+    )
+    return archived_todo_path
+
+
+# ── CLI ──────────────────────────────────────────────────────────
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Unified AI agent launcher for tmux with worktree isolation.",
+        prog="ai-launch",
+    )
+
+    # User-facing flags
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Window/session name (default: derived from todo filename or 'ai')",
+    )
+    parser.add_argument(
+        "--agent",
+        default="claude",
+        help="Agent: claude (default), codex, or arbitrary command",
+    )
+    parser.add_argument(
+        "--todo",
+        default=None,
+        help="Todo file to pipe to agent (triggers autonomous mode)",
+    )
+    parser.add_argument(
+        "--no-worktree",
+        action="store_true",
+        dest="no_worktree",
+        help="Skip worktree creation, run in current directory",
+    )
+
+    # Internal flags (used by launch mode to spawn run mode)
+    parser.add_argument("--_run", action="store_true", dest="run_mode", help=argparse.SUPPRESS)
+    parser.add_argument("--worktree-path", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--repo-root", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--target-branch", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--target-revision", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--branch-name", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--session-id", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--launch-dir", default=None, help=argparse.SUPPRESS)
+
+    return parser.parse_args(argv)
+
+
+# ── Launch Mode ──────────────────────────────────────────────────
+
+
+def cmd_launch(args: argparse.Namespace) -> int:
+    if not os.environ.get("TMUX"):
+        die("Must be running inside tmux")
+
+    ensure_reasonable_path()
+    require_dependency("tmux")
+
+    # Check agent binary
+    agent_bin = args.agent.split()[0] if args.agent not in ("claude", "codex") else args.agent
+    require_dependency(agent_bin)
+
+    launch_dir = Path.cwd().resolve()
+    session_id = tmux_value("#{session_id}")
+
+    # Resolve todo path early
+    todo_path: Path | None = None
+    if args.todo:
+        todo_path = Path(args.todo).expanduser().resolve()
+        if not todo_path.is_file():
+            die(f"Todo file not found: {args.todo}")
+
+    # Derive name
+    name = args.name or (todo_path.stem if todo_path else "ai")
+
+    if args.no_worktree:
+        # No worktree mode: just open a window running the agent
+        window_name = f"{name} ({args.agent})"
+
+        parts: list[str] = [
+            "python3", str(SELF_PATH),
+            "--_run",
+            "--agent", args.agent,
+            "--launch-dir", str(launch_dir),
+            "--name", name,
+        ]
+        if todo_path:
+            parts.extend(["--todo", str(todo_path)])
+
+        runner_cmd = " ".join(shlex.quote(p) for p in parts)
+        tmux_cmd = f"bash -lc {shlex.quote(runner_cmd)}"
+
+        result = run_capture([
+            "tmux", "new-window", "-P", "-F", "#{window_id}",
+            "-t", session_id, "-n", window_name, tmux_cmd,
+        ])
+        if result.returncode != 0:
+            die(f"tmux new-window failed: {(result.stderr or result.stdout).strip()}")
+        print(f"Started {window_name} in {launch_dir}")
+        return 0
+
+    # Worktree mode: need git
+    require_dependency("git")
+    repo_root = resolve_repo_root(launch_dir)
+    target_branch = git_value(
+        repo_root, ["symbolic-ref", "--quiet", "--short", "HEAD"]
+    )
+    target_revision = git_value(repo_root, ["rev-parse", "HEAD"])
+
+    # Create worktree
+    branch_name, worktree_path = make_worktree_identity(name, repo_root)
+    create_worktree(repo_root, target_revision, branch_name, worktree_path)
+
+    # Build internal command
+    window_name = f"{name} ({args.agent})"
+    parts = [
+        "python3", str(SELF_PATH),
+        "--_run",
+        "--worktree-path", str(worktree_path),
+        "--repo-root", str(repo_root),
+        "--agent", args.agent,
+        "--target-branch", target_branch,
+        "--target-revision", target_revision,
+        "--branch-name", branch_name,
+        "--session-id", session_id,
+        "--launch-dir", str(launch_dir),
+        "--name", name,
+    ]
+    if todo_path:
+        parts.extend(["--todo", str(todo_path)])
+
+    runner_cmd = " ".join(shlex.quote(p) for p in parts)
+    tmux_cmd = f"bash -lc {shlex.quote(runner_cmd)}"
+
+    # Open tmux window
+    result = run_capture([
+        "tmux", "new-window", "-P", "-F", "#{window_id}",
+        "-t", session_id, "-n", window_name, tmux_cmd,
+    ])
+    if result.returncode != 0:
+        # Clean up worktree on failure
+        cleanup_worktree(repo_root, worktree_path, branch_name)
+        die(f"tmux new-window failed: {(result.stderr or result.stdout).strip()}")
+
+    run_capture([
+        "tmux", "display-message",
+        f"Started {window_name} in worktree {worktree_path}",
+    ])
+    return 0
+
+
+# ── Run Mode ─────────────────────────────────────────────────────
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    ensure_reasonable_path()
+
+    agent = args.agent
+    todo_path = Path(args.todo).resolve() if args.todo else None
+    name = args.name or (todo_path.stem if todo_path else "ai")
+    has_worktree = args.worktree_path is not None
+
+    if has_worktree:
+        worktree_path = Path(args.worktree_path).resolve()
+        repo_root = Path(args.repo_root).resolve()
+        launch_dir = Path(args.launch_dir).resolve()
+        target_branch = args.target_branch
+        target_revision = args.target_revision
+        branch_name = args.branch_name
+        agent_cwd = resolve_agent_cwd(repo_root, launch_dir, worktree_path)
+    else:
+        agent_cwd = Path(args.launch_dir).resolve() if args.launch_dir else Path.cwd()
+
+    # Run the agent
+    if todo_path:
+        exit_code = run_agent_todo(agent, todo_path, agent_cwd)
+    else:
+        exit_code = run_agent_interactive(agent, agent_cwd)
+
+    # No worktree: nothing else to do
+    if not has_worktree:
+        pause_for_window()
+        return exit_code
+
+    # Show summary
+    has_changes = show_summary(
+        worktree_path, branch_name, target_branch, exit_code
+    )
+
+    if not has_changes:
+        print("")
+        if prompt_cleanup():
+            warnings = cleanup_worktree(repo_root, worktree_path, branch_name)
+            for w in warnings:
+                print(f"WARNING: {w}")
+            print("Cleaned up.")
+        else:
+            print(f"Worktree preserved at: {worktree_path}")
+            print(f"Branch: {branch_name}")
+        pause_for_window()
+        return exit_code
+
+    # Changes exist: prompt for action
+    action = prompt_action(target_branch)
+
+    if action == "merge":
+        try:
+            commit_message = f"ai: {name}"
+            commit_worktree_changes(worktree_path, commit_message)
+
+            gates_ok, gate_msg = enforce_merge_gates(
+                repo_root, target_branch, target_revision
+            )
+            if not gates_ok:
+                print("")
+                print(f"Merge gate warning: {gate_msg}")
+                print("")
+                try:
+                    fallback = input(
+                        "Try merge anyway? [y/n]: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    fallback = "n"
+                if fallback not in ("y", "yes"):
+                    print("")
+                    print(f"Worktree preserved at: {worktree_path}")
+                    print(f"Branch: {branch_name}")
+                    print(
+                        f"Merge manually: cd {repo_root} && "
+                        f"git merge --ff-only {branch_name}"
+                    )
+                    pause_for_window()
+                    return 1
+
+            merge_branch(repo_root, branch_name)
+
+            merged_sha = git_value(repo_root, ["rev-parse", "HEAD"])
+
+            if todo_path:
+                try:
+                    archived = archive_todo(todo_path, merged_sha, branch_name)
+                    print(f"Archived todo: {archived}")
+                except RuntimeError as exc:
+                    print(f"WARNING: Could not archive todo: {exc}")
+
+            warnings = cleanup_worktree(repo_root, worktree_path, branch_name)
+            print("")
+            print(f"Merged {branch_name} into {target_branch}.")
+            for w in warnings:
+                print(f"WARNING: {w}")
+
+        except RuntimeError as exc:
+            print("")
+            print(f"Merge failed: {exc}")
+            print("")
+            print(f"Worktree preserved at: {worktree_path}")
+            print(f"Branch: {branch_name}")
+            print(
+                f"Merge manually: cd {repo_root} && "
+                f"git merge --ff-only {branch_name}"
+            )
+            pause_for_window()
+            return 1
+
+    elif action == "keep":
+        print("")
+        print(f"Worktree preserved at: {worktree_path}")
+        print(f"Branch: {branch_name}")
+        print(
+            f"To merge later: cd {repo_root} && "
+            f"git merge --ff-only {branch_name}"
+        )
+
+    elif action == "discard":
+        warnings = cleanup_worktree(repo_root, worktree_path, branch_name)
+        print("Discarded changes.")
+        for w in warnings:
+            print(f"WARNING: {w}")
+
+    pause_for_window()
+    return 0
+
+
+# ── Main ─────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    try:
+        args = parse_args(sys.argv[1:])
+        if args.run_mode:
+            return cmd_run(args)
+        return cmd_launch(args)
+    except RuntimeError as exc:
+        die(str(exc))
+    except KeyboardInterrupt:
+        die("Cancelled by user")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

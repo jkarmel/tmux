@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Unified AI agent launcher popup for tmux.
+
+Presents fzf-based selections for agent and action (interactive or todo file),
+then calls ai-launch with the appropriate flags.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+
+# ── Constants ────────────────────────────────────────────────────
+
+AGENTS = ["claude", "codex"]
+INTERACTIVE_MARKER = "\u25cf Interactive session"
+SEPARATOR = "\u2500" * 20
+DEFAULT_PATH_SEGMENTS = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+]
+AI_LAUNCH = Path.home() / ".tmux" / "scripts" / "ai-launch"
+
+
+# ── Shared Utilities ─────────────────────────────────────────────
+
+
+def pause_for_popup() -> None:
+    try:
+        input("Press Enter to close...")
+    except EOFError:
+        pass
+
+
+def die(message: str, *, exit_code: int = 1) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    pause_for_popup()
+    raise SystemExit(exit_code)
+
+
+def ensure_reasonable_path() -> None:
+    current = os.environ.get("PATH", "")
+    parts = [part for part in current.split(":") if part]
+    for segment in DEFAULT_PATH_SEGMENTS:
+        if segment not in parts:
+            parts.append(segment)
+    os.environ["PATH"] = ":".join(parts)
+
+
+def require_dependency(command: str) -> None:
+    if shutil.which(command) is None:
+        raise RuntimeError(f"'{command}' is required but not found in PATH")
+
+
+def run_command(
+    command: list[str], *, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command, capture_output=True, text=True, check=False, cwd=cwd
+    )
+
+
+# ── Directory and File Discovery ─────────────────────────────────
+
+
+def get_repo_root() -> Path | None:
+    result = run_command(
+        ["tmux", "display-message", "-p", "#{pane_current_path}"]
+    )
+    start_dir = None
+    if result.returncode == 0:
+        text = result.stdout.strip()
+        if text:
+            path = Path(text)
+            if path.is_dir():
+                start_dir = path
+    if start_dir is None:
+        start_dir = Path.cwd()
+
+    git_result = run_command(
+        ["git", "-C", str(start_dir), "rev-parse", "--show-toplevel"]
+    )
+    if git_result.returncode != 0:
+        return None
+    root = Path(git_result.stdout.strip())
+    return root if root.is_dir() else None
+
+
+def list_todos(repo_root: Path) -> list[str]:
+    todos_dir = repo_root / "todos"
+    if not todos_dir.is_dir():
+        return []
+    candidates: list[str] = []
+    for entry in sorted(todos_dir.rglob("*")):
+        if not entry.is_file():
+            continue
+        if entry.name.startswith("."):
+            continue
+        rel = entry.relative_to(todos_dir)
+        # Skip anything under done/
+        if rel.parts[0] == "done":
+            continue
+        candidates.append(str(rel))
+    return candidates
+
+
+# ── FZF Helpers ──────────────────────────────────────────────────
+
+
+def fzf_pick(
+    items: list[str],
+    *,
+    prompt: str = "> ",
+    header: str | None = None,
+    preview: str | None = None,
+    cwd: Path | None = None,
+) -> str | None:
+    input_path: Path | None = None
+    output_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="ai-popup-in.", delete=False
+        ) as infile:
+            infile.write("\n".join(items))
+            infile.write("\n")
+            input_path = Path(infile.name)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="ai-popup-out.", delete=False
+        ) as outfile:
+            output_path = Path(outfile.name)
+
+        cmd = [
+            "fzf",
+            "--prompt", prompt,
+            "--height", "100%",
+            "--layout", "reverse",
+        ]
+        if header:
+            cmd.extend(["--header", header])
+        if preview:
+            cmd.extend(["--preview-window", "right:60%:wrap", "--preview", preview])
+
+        with input_path.open("r", encoding="utf-8") as stdin_fh, \
+             output_path.open("w", encoding="utf-8") as stdout_fh:
+            result = subprocess.run(
+                cmd, stdin=stdin_fh, stdout=stdout_fh, check=False, cwd=cwd,
+            )
+
+        if result.returncode != 0:
+            return None
+
+        picked = output_path.read_text(encoding="utf-8").strip()
+        return picked or None
+    finally:
+        if input_path is not None:
+            input_path.unlink(missing_ok=True)
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+
+
+# ── Steps ────────────────────────────────────────────────────────
+
+
+def step_pick_agent() -> str | None:
+    return fzf_pick(
+        AGENTS,
+        prompt="agent> ",
+        header="Pick an AI agent",
+    )
+
+
+def step_pick_action(candidates: list[str], todos_dir: Path) -> str | None:
+    items = [INTERACTIVE_MARKER]
+    if candidates:
+        items.append(SEPARATOR)
+        items.extend(candidates)
+    return fzf_pick(
+        items,
+        prompt="action> ",
+        header="Interactive session or pick a todo file",
+    )
+
+
+def step_pick_name() -> str:
+    try:
+        name = input("Session name (Enter for default): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        name = ""
+    return name
+
+
+# ── Main ─────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    try:
+        ensure_reasonable_path()
+        require_dependency("tmux")
+        require_dependency("fzf")
+
+        if not AI_LAUNCH.is_file():
+            die(f"Missing ai-launch script: {AI_LAUNCH}")
+
+        repo_root = get_repo_root()
+
+        # Step 1: pick agent
+        agent = step_pick_agent()
+        if agent is None:
+            return 0
+
+        # Find todo files in todos/ directory
+        candidates = list_todos(repo_root) if repo_root else []
+        todos_dir = repo_root / "todos" if repo_root else None
+
+        # Step 2: pick action
+        if candidates and todos_dir:
+            action = step_pick_action(candidates, todos_dir)
+            if action is None:
+                return 0
+        else:
+            # No todos directory — go straight to interactive
+            action = INTERACTIVE_MARKER
+
+        # Determine mode
+        if action == INTERACTIVE_MARKER:
+            # Step 3: pick name
+            name = step_pick_name()
+            cmd: list[str] = [str(AI_LAUNCH), "--agent", agent]
+            if name:
+                cmd.extend(["--name", name])
+        elif action == SEPARATOR:
+            # User selected the separator line — treat as cancel
+            return 0
+        else:
+            # Todo file selected
+            todo_path = (todos_dir / action).resolve()
+            if not todo_path.is_file():
+                die(f"Selected file does not exist: {todo_path}")
+            cmd = [str(AI_LAUNCH), "--agent", agent, "--todo", str(todo_path)]
+
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            pause_for_popup()
+        return result.returncode
+
+    except RuntimeError as exc:
+        die(str(exc))
+    except KeyboardInterrupt:
+        die("Cancelled by user")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
