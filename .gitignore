@@ -1,0 +1,4 @@
+.env
+plugins/
+worktrees/
+scripts/__pycache__/
