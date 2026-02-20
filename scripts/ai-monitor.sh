@@ -39,6 +39,12 @@ is_ai_window() {
     [[ "$window_name" == *"(claude)"* || "$window_name" == *"(codex)"* ]]
 }
 
+pane_has_ai_process() {
+    local pane_tty="$1"
+    [[ -n "$pane_tty" ]] || return 1
+    ps -o command= -t "$pane_tty" 2>/dev/null | grep -Eiq '(^|/)(claude|codex)(\s|$)'
+}
+
 pane_has_autonomous_agent() {
     local pane_tty="$1"
     [[ -n "$pane_tty" ]] || return 1
@@ -70,7 +76,11 @@ while true; do
 
             echo "$hash" > "$STATEDIR/$pane_key.hash"
 
-            if pane_has_autonomous_agent "$pane_tty"; then
+            if ! pane_has_ai_process "$pane_tty"; then
+                # No claude/codex process on the TTY — agent has exited.
+                echo "$count" > "$STATEDIR/$pane_key.count"
+                tmux set-option -wq -t "$target" @ai_status "done" 2>/dev/null
+            elif pane_has_autonomous_agent "$pane_tty"; then
                 # Autonomous one-shot runs can stay quiet for long stretches.
                 # Keep them active while the command is still present on the pane TTY.
                 count=0
@@ -89,22 +99,25 @@ while true; do
     # Build status-line summary (agent counts) for the status bar
     active=0
     idle=0
+    done_count=0
     while IFS=$'\t' read -r _t n s; do
         if is_ai_window "$n"; then
-            if [[ "$s" == "active" ]]; then
-                ((active++))
-            else
-                ((idle++))
-            fi
+            case "$s" in
+                active) ((active++)) ;;
+                done)   ((done_count++)) ;;
+                *)      ((idle++)) ;;
+            esac
         fi
     done < <(tmux list-windows -a -F "#{session_name}:#{window_index}	#{window_name}	#{@ai_status}" 2>/dev/null)
+    parts=()
+    (( idle > 0 ))       && parts+=("$idle 🤖")
+    (( active > 0 ))     && parts+=("$active ⚡")
+    (( done_count > 0 )) && parts+=("$done_count ✅")
     summary=""
-    if (( idle > 0 && active > 0 )); then
-        summary="$idle 🤖 | $active ⚡"
-    elif (( idle > 0 )); then
-        summary="$idle 🤖"
-    elif (( active > 0 )); then
-        summary="$active ⚡"
+    if (( ${#parts[@]} > 0 )); then
+        IFS=' | '
+        summary="${parts[*]}"
+        unset IFS
     fi
     tmux set -gq @ai_status_line "$summary"
 

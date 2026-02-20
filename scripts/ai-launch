@@ -219,10 +219,10 @@ def run_agent_todo(agent: str, todo_path: Path, cwd: Path) -> int:
             [
                 "claude",
                 "--dangerously-skip-permissions",
-                "-p",
-                todo_content,
             ],
             cwd=cwd,
+            input=todo_content,
+            text=True,
             check=False,
         )
     else:
