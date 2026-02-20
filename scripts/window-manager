@@ -35,23 +35,47 @@ _FIXED_PAIRS = 4
 _color_pair_cache: dict[tuple[int, int], int] = {}
 _next_pair_id = _FIXED_PAIRS + 1
 
-ANSI_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
+# Custom RGB colors start after the standard 256 palette
+_custom_color_cache: dict[tuple[int, int, int], int] = {}
+_next_color_id = 256
+_can_change: bool | None = None  # resolved at runtime
+
+# Match SGR sequences with ; or : separators (tmux uses : for ISO 8613-6)
+ANSI_SGR_RE = re.compile(r"\033\[([0-9;:]*)m")
 
 
 def _rgb_to_256(r: int, g: int, b: int) -> int:
     """Map 24-bit RGB to the nearest xterm-256 color index."""
-    # Grayscale shortcut
     if r == g == b:
         if r < 8:
             return 16
         if r > 248:
             return 231
         return round((r - 8) / 247 * 24) + 232
-    # 6x6x6 color cube
     ri = round(r / 255 * 5)
     gi = round(g / 255 * 5)
     bi = round(b / 255 * 5)
     return 16 + 36 * ri + 6 * gi + bi
+
+
+def _get_rgb_color(r: int, g: int, b: int) -> int:
+    """Get a curses color index for an exact RGB value.
+
+    Uses init_color to define custom colors when the terminal supports it,
+    falling back to the nearest 256-color approximation otherwise.
+    """
+    global _next_color_id, _can_change
+    if _can_change is None:
+        _can_change = curses.can_change_color()
+    key = (r, g, b)
+    if key in _custom_color_cache:
+        return _custom_color_cache[key]
+    if not _can_change or _next_color_id >= curses.COLORS:
+        return _rgb_to_256(r, g, b)
+    curses.init_color(_next_color_id, r * 1000 // 255, g * 1000 // 255, b * 1000 // 255)
+    _custom_color_cache[key] = _next_color_id
+    _next_color_id += 1
+    return _custom_color_cache[key]
 
 
 def _char_width(ch: str) -> int:
@@ -334,7 +358,7 @@ def render_ansi_line(
         m = ANSI_SGR_RE.match(text, pos)
         if m:
             params_str = m.group(1)
-            params = params_str.split(";") if params_str else ["0"]
+            params = re.split(r"[;:]", params_str) if params_str else ["0"]
             i = 0
             while i < len(params):
                 try:
@@ -381,9 +405,16 @@ def render_ansi_line(
                             r = int(params[i + 2])
                             g = int(params[i + 3])
                             b = int(params[i + 4])
-                            fg = _rgb_to_256(r, g, b)
+                            fg = _get_rgb_color(r, g, b)
                             i += 4
-                    except ValueError:
+                        elif mode == 2 and i + 3 < len(params):
+                            # tmux sometimes omits colorspace: 38:2:r:g:b
+                            r = int(params[i + 2])
+                            g = int(params[i + 3])
+                            b = int(params[i + 4]) if i + 4 < len(params) else 0
+                            fg = _get_rgb_color(r, g, b)
+                            i += 4 if i + 4 < len(params) else 3
+                    except (ValueError, IndexError):
                         pass
                 elif p == 48 and i + 1 < len(params):
                     try:
@@ -395,9 +426,15 @@ def render_ansi_line(
                             r = int(params[i + 2])
                             g = int(params[i + 3])
                             b = int(params[i + 4])
-                            bg = _rgb_to_256(r, g, b)
+                            bg = _get_rgb_color(r, g, b)
                             i += 4
-                    except ValueError:
+                        elif mode == 2 and i + 3 < len(params):
+                            r = int(params[i + 2])
+                            g = int(params[i + 3])
+                            b = int(params[i + 4]) if i + 4 < len(params) else 0
+                            bg = _get_rgb_color(r, g, b)
+                            i += 4 if i + 4 < len(params) else 3
+                    except (ValueError, IndexError):
                         pass
                 elif p == 39:
                     fg = -1
