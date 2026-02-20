@@ -430,6 +430,9 @@ def ui(stdscr) -> None:
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
+        # Force full redraw — curses doesn't know about our raw ANSI
+        # preview writes, so without this it skips "unchanged" positions
+        stdscr.touchwin()
         stdscr.refresh()
 
         # Draw preview with raw ANSI escape codes AFTER curses refresh.
