@@ -259,18 +259,26 @@ def build_tree(
     return items, hotkey_map
 
 
-def build_session_tree(windows: list[Window]) -> list[TreeItem]:
+def build_session_tree(
+    windows: list[Window],
+) -> tuple[list[TreeItem], dict[str, Window]]:
     """Build tree for a single session (windows only, no session headers)."""
+    # Skip h/l (session nav) in addition to j/k (nav) and q (quit)
+    pool = "abcdefgimnoprstuvwxyz"
     items: list[TreeItem] = []
-    has_any_ai = any(is_ai_window(w) for w in windows)
+    hotkey_map: dict[str, Window] = {}
+    hotkey_idx = 0
     for w in windows:
-        emoji = ai_emoji(w)
-        if has_any_ai and not emoji:
-            emoji = "   "
-        marker = "* " if w.is_current else "  "
-        label = f"  {marker}{emoji}{w.index}: {w.name}"
-        items.append(TreeItem(kind="window", label=label, window=w))
-    return items
+        name = _clean_window_name(w.name)
+        emoji = ai_emoji(w).strip()
+        suffix = f" {emoji}" if emoji else ""
+        label = f"{name}{suffix}"
+        hotkey = pool[hotkey_idx] if hotkey_idx < len(pool) else None
+        if hotkey:
+            hotkey_map[hotkey] = w
+            hotkey_idx += 1
+        items.append(TreeItem(kind="window", label=label, window=w, hotkey=hotkey))
+    return items, hotkey_map
 
 
 def selectable_indices(items: list[TreeItem]) -> list[int]:
@@ -577,10 +585,11 @@ def session_ui(stdscr) -> None:
     """Session-focused window browser with h/l to cycle sessions."""
     curses.curs_set(0)
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)
-    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
-    curses.init_pair(3, curses.COLOR_WHITE, -1)
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+    curses.init_pair(1, curses.COLOR_CYAN, -1)       # session header
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected
+    curses.init_pair(3, curses.COLOR_WHITE, -1)      # normal window
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)     # help bar
+    curses.init_pair(5, curses.COLOR_CYAN, -1)       # dim hotkey letter
 
     sessions = get_windows()
     if not sessions:
@@ -602,10 +611,11 @@ def session_ui(stdscr) -> None:
     selected = 0
     items: list[TreeItem] = []
     sel_indices: list[int] = []
+    hotkey_map: dict[str, Window] = {}
 
     def rebuild() -> None:
-        nonlocal items, sel_indices, selected
-        items = build_session_tree(sessions[session_names[session_idx]])
+        nonlocal items, sel_indices, selected, hotkey_map
+        items, hotkey_map = build_session_tree(sessions[session_names[session_idx]])
         sel_indices = selectable_indices(items)
         selected = 0
         for i, idx in enumerate(sel_indices):
@@ -632,6 +642,7 @@ def session_ui(stdscr) -> None:
         help_row = height - 1
         tree_start = 1  # row 0 is the session header
         tree_height = help_row - tree_start
+        name_col = 2  # column where window names start (after hotkey)
 
         # Keep selection visible
         if sel_indices:
@@ -653,20 +664,27 @@ def session_ui(stdscr) -> None:
         # Session header with navigation arrows
         name = session_names[session_idx]
         n = len(session_names)
-        header = f" \u25c0 {name} \u25b6  ({session_idx + 1}/{n})"
+        header = f"\u25c0 {name} \u25b6  ({session_idx + 1}/{n})"
         safe_addstr(stdscr, 0, 0, header, list_width,
                     curses.color_pair(1) | curses.A_BOLD)
 
-        # Window list
+        # Window list — matches main UI layout: dim hotkey at col 0, name at col 2
         for row in range(tree_height):
             item_idx = scroll_offset + row
             if item_idx >= len(items):
                 break
             item = items[item_idx]
+            # Dim hotkey letter
+            if item.hotkey:
+                safe_addstr(
+                    stdscr, tree_start + row, 0, item.hotkey,
+                    1, curses.color_pair(5) | curses.A_DIM,
+                )
+            # Window name + emoji
             is_sel = sel_indices and item_idx == sel_indices[selected]
             attr = curses.color_pair(2) if is_sel else curses.color_pair(3)
-            safe_addstr(stdscr, tree_start + row, 0, item.label,
-                        list_width, attr)
+            safe_addstr(stdscr, tree_start + row, name_col, item.label,
+                        list_width - name_col, attr)
 
         # Separator
         for row in range(help_row):
@@ -679,7 +697,7 @@ def session_ui(stdscr) -> None:
         # Help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " j/k:nav  h/l:session  Enter:switch  /:search  q:quit",
+            " a-z:jump  h/l:session  j/k:nav  /:search  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -740,6 +758,12 @@ def session_ui(stdscr) -> None:
 
         elif key in (ord("q"), 27):  # q or Esc
             return
+
+        elif 0x20 <= key <= 0x7E:
+            ch = chr(key)
+            if ch in hotkey_map:
+                switch_to_window(hotkey_map[ch])
+                return
 
 
 def preview_mode(pane_id: str) -> None:
