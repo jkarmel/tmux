@@ -107,18 +107,23 @@ def get_windows() -> dict[str, list[Window]]:
     return sessions
 
 
-def ai_emoji(window: Window) -> str:
+def is_ai_window(window: Window) -> bool:
     name = window.name.lower()
-    if "(claude)" in name or "(codex)" in name:
-        if window.ai_status == "active":
-            return "\u26a1 "  # lightning
-        if window.ai_status == "done":
-            return "\u2705 "  # check
-        return "\U0001f916 "  # robot
-    return ""
+    return "(claude)" in name or "(codex)" in name
 
 
-def capture_pane_bottom(pane_id: str, lines: int) -> list[str]:
+def ai_emoji(window: Window) -> str:
+    if not is_ai_window(window):
+        return ""
+    if window.ai_status == "active":
+        return "\u26a1 "  # lightning
+    if window.ai_status == "done":
+        return "\u2705 "  # check
+    return "\U0001f916 "  # robot
+
+
+def capture_pane(pane_id: str) -> list[str]:
+    """Capture visible pane content, stripping trailing blank lines."""
     result = subprocess.run(
         ["tmux", "capture-pane", "-t", pane_id, "-p"],
         capture_output=True, text=True,
@@ -126,10 +131,25 @@ def capture_pane_bottom(pane_id: str, lines: int) -> list[str]:
     if result.returncode != 0:
         return ["(unable to capture pane)"]
     content = result.stdout.rstrip("\n").split("\n")
-    # Strip trailing blank lines
     while content and not content[-1].strip():
         content.pop()
-    return content[-lines:] if len(content) > lines else content
+    return content
+
+
+def should_bottom_align(window: Window, content: list[str]) -> bool:
+    """AI windows always bottom-align. Others bottom-align when the top is
+    mostly blank (like a shell with a prompt at the bottom)."""
+    if is_ai_window(window):
+        return True
+    if not content:
+        return False
+    leading_blank = 0
+    for line in content:
+        if not line.strip():
+            leading_blank += 1
+        else:
+            break
+    return leading_blank > len(content) * 0.4
 
 
 def switch_to_window(window: Window) -> None:
@@ -261,26 +281,39 @@ def ui(stdscr) -> None:
         if sel_tree_idx >= scroll_offset + tree_height:
             scroll_offset = sel_tree_idx - tree_height + 1
 
-        # Also try to show the session header above the first window
-        if scroll_offset > 0:
-            for look_back in range(sel_tree_idx - 1, -1, -1):
-                if items[look_back].kind == "session":
-                    if look_back < scroll_offset:
-                        scroll_offset = look_back
-                    break
+        # Find session header for current selection
+        session_header_idx = None
+        for look_back in range(sel_tree_idx, -1, -1):
+            if items[look_back].kind == "session":
+                session_header_idx = look_back
+                break
+
+        # Sticky header when session header is scrolled off the top
+        sticky_header = None
+        if session_header_idx is not None and session_header_idx < scroll_offset:
+            sticky_header = items[session_header_idx]
 
         # Capture preview
         sel_window = items[sel_indices[selected]].window
         if sel_window:
             if sel_window.pane_id != last_pane_id:
                 last_pane_id = sel_window.pane_id
-                preview_cache = capture_pane_bottom(sel_window.pane_id, tree_height)
+                preview_cache = capture_pane(sel_window.pane_id)
 
         stdscr.erase()
 
+        # Draw sticky session header if needed
+        tree_start_row = 0
+        if sticky_header:
+            safe_addstr(
+                stdscr, 0, 0, f" {sticky_header.label}",
+                list_width, curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
+            )
+            tree_start_row = 1
+
         # Draw tree
-        for row in range(tree_height):
-            tree_idx = scroll_offset + row
+        for row in range(tree_start_row, tree_height):
+            tree_idx = scroll_offset + (row - tree_start_row)
             if tree_idx >= len(items):
                 break
             item = items[tree_idx]
@@ -301,10 +334,15 @@ def ui(stdscr) -> None:
             except curses.error:
                 pass
 
-        # Draw preview (bottom-aligned)
-        if preview_width > 0 and preview_cache:
-            start_row = max(0, tree_height - len(preview_cache))
-            for i, line in enumerate(preview_cache):
+        # Draw preview (alignment depends on window type and content)
+        if preview_width > 0 and preview_cache and sel_window:
+            if should_bottom_align(sel_window, preview_cache):
+                visible = preview_cache[-tree_height:]
+                start_row = max(0, tree_height - len(visible))
+            else:
+                visible = preview_cache[:tree_height]
+                start_row = 0
+            for i, line in enumerate(visible):
                 row = start_row + i
                 if row >= tree_height:
                     break
@@ -325,7 +363,7 @@ def ui(stdscr) -> None:
         if key == -1:
             # Timeout — refresh preview for live updates
             if sel_window:
-                preview_cache = capture_pane_bottom(sel_window.pane_id, tree_height)
+                preview_cache = capture_pane(sel_window.pane_id)
             continue
 
         if key in (ord("j"), curses.KEY_DOWN):
