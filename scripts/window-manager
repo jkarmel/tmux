@@ -38,6 +38,22 @@ _next_pair_id = _FIXED_PAIRS + 1
 ANSI_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
 
 
+def _rgb_to_256(r: int, g: int, b: int) -> int:
+    """Map 24-bit RGB to the nearest xterm-256 color index."""
+    # Grayscale shortcut
+    if r == g == b:
+        if r < 8:
+            return 16
+        if r > 248:
+            return 231
+        return round((r - 8) / 247 * 24) + 232
+    # 6x6x6 color cube
+    ri = round(r / 255 * 5)
+    gi = round(g / 255 * 5)
+    bi = round(b / 255 * 5)
+    return 16 + 36 * ri + 6 * gi + bi
+
+
 def _char_width(ch: str) -> int:
     """Approximate terminal display width of a character."""
     cp = ord(ch)
@@ -311,8 +327,7 @@ def render_ansi_line(
     max_col = min(x + max_width, width)
     col = x
     fg, bg = -1, -1
-    bold = False
-    dim = False
+    bold = dim = italic = underline = reverse = False
 
     pos = 0
     while pos < len(text) and col < max_col:
@@ -328,13 +343,26 @@ def render_ansi_line(
                     i += 1
                     continue
                 if p == 0:
-                    fg, bg, bold, dim = -1, -1, False, False
+                    fg, bg = -1, -1
+                    bold = dim = italic = underline = reverse = False
                 elif p == 1:
                     bold = True
                 elif p == 2:
                     dim = True
+                elif p == 3:
+                    italic = True
+                elif p == 4:
+                    underline = True
+                elif p == 7:
+                    reverse = True
                 elif p == 22:
-                    bold, dim = False, False
+                    bold = dim = False
+                elif p == 23:
+                    italic = False
+                elif p == 24:
+                    underline = False
+                elif p == 27:
+                    reverse = False
                 elif 30 <= p <= 37:
                     fg = p - 30
                 elif 40 <= p <= 47:
@@ -343,18 +371,32 @@ def render_ansi_line(
                     fg = p - 82  # maps to curses colors 8–15
                 elif 100 <= p <= 107:
                     bg = p - 92
-                elif p == 38 and i + 2 < len(params):
+                elif p == 38 and i + 1 < len(params):
                     try:
-                        if int(params[i + 1]) == 5:
+                        mode = int(params[i + 1])
+                        if mode == 5 and i + 2 < len(params):
                             fg = int(params[i + 2])
                             i += 2
+                        elif mode == 2 and i + 4 < len(params):
+                            r = int(params[i + 2])
+                            g = int(params[i + 3])
+                            b = int(params[i + 4])
+                            fg = _rgb_to_256(r, g, b)
+                            i += 4
                     except ValueError:
                         pass
-                elif p == 48 and i + 2 < len(params):
+                elif p == 48 and i + 1 < len(params):
                     try:
-                        if int(params[i + 1]) == 5:
+                        mode = int(params[i + 1])
+                        if mode == 5 and i + 2 < len(params):
                             bg = int(params[i + 2])
                             i += 2
+                        elif mode == 2 and i + 4 < len(params):
+                            r = int(params[i + 2])
+                            g = int(params[i + 3])
+                            b = int(params[i + 4])
+                            bg = _rgb_to_256(r, g, b)
+                            i += 4
                     except ValueError:
                         pass
                 elif p == 39:
@@ -397,6 +439,12 @@ def render_ansi_line(
             attr |= curses.A_BOLD
         if dim:
             attr |= curses.A_DIM
+        if underline:
+            attr |= curses.A_UNDERLINE
+        if reverse:
+            attr |= curses.A_REVERSE
+        if italic:
+            attr |= getattr(curses, "A_ITALIC", 0)
         try:
             win.addch(y, col, ch, attr)
         except curses.error:
