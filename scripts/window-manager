@@ -414,7 +414,7 @@ def ui(stdscr) -> None:
     curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected
     curses.init_pair(3, curses.COLOR_WHITE, -1)      # normal window
     curses.init_pair(4, curses.COLOR_YELLOW, -1)     # help bar
-    curses.init_pair(5, curses.COLOR_CYAN, -1)       # dim hotkey letter
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)    # hotkey letter
 
     sessions = get_windows()
     if not sessions:
@@ -502,7 +502,7 @@ def ui(stdscr) -> None:
                 if item.hotkey:
                     safe_addstr(
                         stdscr, row, 0, item.hotkey,
-                        1, curses.color_pair(5) | curses.A_DIM,
+                        1, curses.color_pair(5) | curses.A_BOLD,
                     )
                 # Window name + emoji
                 is_sel = tree_idx == sel_indices[selected]
@@ -589,7 +589,7 @@ def session_ui(stdscr) -> None:
     curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected
     curses.init_pair(3, curses.COLOR_WHITE, -1)      # normal window
     curses.init_pair(4, curses.COLOR_YELLOW, -1)     # help bar
-    curses.init_pair(5, curses.COLOR_CYAN, -1)       # dim hotkey letter
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)    # hotkey letter
 
     sessions = get_windows()
     if not sessions:
@@ -678,7 +678,7 @@ def session_ui(stdscr) -> None:
             if item.hotkey:
                 safe_addstr(
                     stdscr, tree_start + row, 0, item.hotkey,
-                    1, curses.color_pair(5) | curses.A_DIM,
+                    1, curses.color_pair(5) | curses.A_BOLD,
                 )
             # Window name + emoji
             is_sel = sel_indices and item_idx == sel_indices[selected]
