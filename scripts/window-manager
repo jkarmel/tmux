@@ -30,58 +30,10 @@ DEFAULT_PATH_SEGMENTS = [
     "/sbin",
 ]
 
-# Predefined color pairs (1–4); dynamic pairs start at 5
-_FIXED_PAIRS = 4
-_color_pair_cache: dict[tuple[int, int], int] = {}
-_next_pair_id = _FIXED_PAIRS + 1
-
-# Custom RGB colors reuse extended palette slots (16–255), avoiding 0–15
-_custom_color_cache: dict[tuple[int, int, int], int] = {}
-_next_color_id = 16
-
 # Match SGR sequences with ; or : separators (tmux uses : for ISO 8613-6)
 ANSI_SGR_RE = re.compile(r"\033\[([0-9;:]*)m")
-
-
-def _rgb_to_256(r: int, g: int, b: int) -> int:
-    """Map 24-bit RGB to the nearest xterm-256 color index."""
-    if r == g == b:
-        if r < 8:
-            return 16
-        if r > 248:
-            return 231
-        return round((r - 8) / 247 * 24) + 232
-    ri = round(r / 255 * 5)
-    gi = round(g / 255 * 5)
-    bi = round(b / 255 * 5)
-    return 16 + 36 * ri + 6 * gi + bi
-
-
-def _get_rgb_color(r: int, g: int, b: int) -> int:
-    """Get a curses color index for an exact RGB value.
-
-    Tries init_color regardless of can_change_color (tmux/screen terminfo
-    often reports False even though the underlying terminal supports it).
-    Falls back to nearest 256-color approximation on failure.
-    """
-    global _next_color_id
-    key = (r, g, b)
-    if key in _custom_color_cache:
-        return _custom_color_cache[key]
-    if _next_color_id < curses.COLORS:
-        try:
-            curses.init_color(
-                _next_color_id,
-                r * 1000 // 255,
-                g * 1000 // 255,
-                b * 1000 // 255,
-            )
-            _custom_color_cache[key] = _next_color_id
-            _next_color_id += 1
-            return _custom_color_cache[key]
-        except curses.error:
-            pass
-    return _rgb_to_256(r, g, b)
+# Match any escape sequence (SGR, cursor movement, etc.)
+ANSI_ANY_RE = re.compile(r"\033(?:\[[0-9;:]*[A-Za-z]|\][^\033]*(?:\033\\|\007))")
 
 
 def _char_width(ch: str) -> int:
@@ -96,6 +48,45 @@ def _char_width(ch: str) -> int:
     if 0x1F000 <= cp <= 0x1FFFF or 0x2600 <= cp <= 0x27BF:
         return 2
     return 1
+
+
+def _truncate_ansi(text: str, max_cols: int) -> str:
+    """Truncate an ANSI-colored string to max_cols display columns.
+
+    Preserves escape sequences (zero display width) and expands tabs.
+    Appends a reset so colors don't bleed.
+    """
+    result: list[str] = []
+    col = 0
+    pos = 0
+    while pos < len(text) and col < max_cols:
+        # Pass through any escape sequence (zero width)
+        m = ANSI_ANY_RE.match(text, pos)
+        if m:
+            result.append(m.group(0))
+            pos = m.end()
+            continue
+        # Bare ESC that didn't match a known sequence — skip to end of it
+        if text[pos] == "\033":
+            end = pos + 1
+            while end < len(text) and text[end] not in "ABCDEFGHJKSTfmnsulh":
+                end += 1
+            pos = end + 1 if end < len(text) else end
+            continue
+        ch = text[pos]
+        pos += 1
+        if ch == "\t":
+            spaces = min(8 - (col % 8), max_cols - col)
+            result.append(" " * spaces)
+            col += spaces
+        else:
+            cw = _char_width(ch)
+            if col + cw > max_cols:
+                break
+            result.append(ch)
+            col += cw
+    result.append("\033[0m")
+    return "".join(result)
 
 
 # ── Utilities ────────────────────────────────────────────────────
@@ -329,180 +320,6 @@ def safe_addstr(win, y: int, x: int, text: str, max_width: int, attr: int = 0) -
         col += 1
 
 
-def _get_color_pair(fg: int, bg: int) -> int:
-    """Get or create a curses color pair for the given fg/bg."""
-    global _next_pair_id
-    key = (fg, bg)
-    if key in _color_pair_cache:
-        return _color_pair_cache[key]
-    try:
-        max_pairs = curses.COLOR_PAIRS
-    except AttributeError:
-        max_pairs = 256
-    if _next_pair_id >= max_pairs:
-        return 0
-    curses.init_pair(_next_pair_id, fg, bg)
-    _color_pair_cache[key] = _next_pair_id
-    _next_pair_id += 1
-    return _color_pair_cache[key]
-
-
-def render_ansi_line(
-    win, y: int, x: int, text: str, max_width: int,
-) -> None:
-    """Render a line containing ANSI SGR escape codes using curses colors."""
-    height, width = win.getmaxyx()
-    if y < 0 or y >= height or x >= width or max_width <= 0:
-        return
-    max_col = min(x + max_width, width)
-    col = x
-    fg, bg = -1, -1
-    bold = dim = italic = underline = reverse = False
-
-    pos = 0
-    while pos < len(text) and col < max_col:
-        m = ANSI_SGR_RE.match(text, pos)
-        if m:
-            params_str = m.group(1)
-            params = re.split(r"[;:]", params_str) if params_str else ["0"]
-            i = 0
-            while i < len(params):
-                try:
-                    p = int(params[i])
-                except ValueError:
-                    i += 1
-                    continue
-                if p == 0:
-                    fg, bg = -1, -1
-                    bold = dim = italic = underline = reverse = False
-                elif p == 1:
-                    bold = True
-                elif p == 2:
-                    dim = True
-                elif p == 3:
-                    italic = True
-                elif p == 4:
-                    underline = True
-                elif p == 7:
-                    reverse = True
-                elif p == 22:
-                    bold = dim = False
-                elif p == 23:
-                    italic = False
-                elif p == 24:
-                    underline = False
-                elif p == 27:
-                    reverse = False
-                elif 30 <= p <= 37:
-                    fg = p - 30
-                elif 40 <= p <= 47:
-                    bg = p - 40
-                elif 90 <= p <= 97:
-                    fg = p - 82  # maps to curses colors 8–15
-                elif 100 <= p <= 107:
-                    bg = p - 92
-                elif p == 38 and i + 1 < len(params):
-                    try:
-                        mode = int(params[i + 1])
-                        if mode == 5 and i + 2 < len(params):
-                            fg = int(params[i + 2])
-                            i += 2
-                        elif mode == 2 and i + 4 < len(params):
-                            r = int(params[i + 2])
-                            g = int(params[i + 3])
-                            b = int(params[i + 4])
-                            fg = _get_rgb_color(r, g, b)
-                            i += 4
-                        elif mode == 2 and i + 3 < len(params):
-                            # tmux sometimes omits colorspace: 38:2:r:g:b
-                            r = int(params[i + 2])
-                            g = int(params[i + 3])
-                            b = int(params[i + 4]) if i + 4 < len(params) else 0
-                            fg = _get_rgb_color(r, g, b)
-                            i += 4 if i + 4 < len(params) else 3
-                    except (ValueError, IndexError):
-                        pass
-                elif p == 48 and i + 1 < len(params):
-                    try:
-                        mode = int(params[i + 1])
-                        if mode == 5 and i + 2 < len(params):
-                            bg = int(params[i + 2])
-                            i += 2
-                        elif mode == 2 and i + 4 < len(params):
-                            r = int(params[i + 2])
-                            g = int(params[i + 3])
-                            b = int(params[i + 4])
-                            bg = _get_rgb_color(r, g, b)
-                            i += 4
-                        elif mode == 2 and i + 3 < len(params):
-                            r = int(params[i + 2])
-                            g = int(params[i + 3])
-                            b = int(params[i + 4]) if i + 4 < len(params) else 0
-                            bg = _get_rgb_color(r, g, b)
-                            i += 4 if i + 4 < len(params) else 3
-                    except (ValueError, IndexError):
-                        pass
-                elif p == 39:
-                    fg = -1
-                elif p == 49:
-                    bg = -1
-                i += 1
-            pos = m.end()
-            continue
-
-        # Skip other escape sequences (cursor movement, etc.)
-        if text[pos] == "\033":
-            end = pos + 1
-            while end < len(text) and text[end] not in "ABCDEFGHJKSTfmnsulh":
-                end += 1
-            pos = end + 1 if end < len(text) else end
-            continue
-
-        ch = text[pos]
-        pos += 1
-
-        if ch == "\t":
-            spaces = 8 - ((col - x) % 8)
-            for _ in range(min(spaces, max_col - col)):
-                try:
-                    win.addch(y, col, " ")
-                except curses.error:
-                    return
-                col += 1
-            continue
-
-        cw = _char_width(ch)
-        if col + cw > max_col:
-            break
-        attr = 0
-        pair_id = _get_color_pair(fg, bg)
-        if pair_id:
-            attr = curses.color_pair(pair_id)
-        if bold:
-            attr |= curses.A_BOLD
-        if dim:
-            attr |= curses.A_DIM
-        if underline:
-            attr |= curses.A_UNDERLINE
-        if reverse:
-            attr |= curses.A_REVERSE
-        if italic:
-            attr |= getattr(curses, "A_ITALIC", 0)
-        try:
-            win.addch(y, col, ch, attr)
-        except curses.error:
-            return
-        col += cw
-
-    # Clear remaining columns
-    while col < max_col:
-        try:
-            win.addch(y, col, " ")
-        except curses.error:
-            return
-        col += 1
-
-
 # ── Main UI ──────────────────────────────────────────────────────
 
 
@@ -606,20 +423,6 @@ def ui(stdscr) -> None:
             except curses.error:
                 pass
 
-        # Draw preview (alignment depends on window type and content)
-        if preview_width > 0 and preview_cache and sel_window:
-            if should_bottom_align(sel_window, preview_cache):
-                visible = preview_cache[-tree_height:]
-                start_row = max(0, tree_height - len(visible))
-            else:
-                visible = preview_cache[:tree_height]
-                start_row = 0
-            for i, line in enumerate(visible):
-                row = start_row + i
-                if row >= tree_height:
-                    break
-                render_ansi_line(stdscr, row, preview_start, line, preview_width)
-
         # Draw help bar
         safe_addstr(
             stdscr, help_row, 0,
@@ -628,6 +431,29 @@ def ui(stdscr) -> None:
         )
 
         stdscr.refresh()
+
+        # Draw preview with raw ANSI escape codes AFTER curses refresh.
+        # This bypasses curses color handling entirely — the terminal
+        # renders the exact same escape sequences from capture-pane -e,
+        # so colors are pixel-perfect.
+        if preview_width > 0 and preview_cache and sel_window:
+            if should_bottom_align(sel_window, preview_cache):
+                visible = preview_cache[-tree_height:]
+                start_row = max(0, tree_height - len(visible))
+            else:
+                visible = preview_cache[:tree_height]
+                start_row = 0
+            buf: list[str] = []
+            for i, line in enumerate(visible):
+                row = start_row + i
+                if row >= tree_height:
+                    break
+                truncated = _truncate_ansi(line, preview_width)
+                # ANSI cursor positioning is 1-based
+                buf.append(f"\033[{row + 1};{preview_start + 1}H{truncated}")
+            buf.append("\033[0m")
+            sys.stdout.write("".join(buf))
+            sys.stdout.flush()
 
         # Input
         key = stdscr.getch()
