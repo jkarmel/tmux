@@ -17,6 +17,7 @@ import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -246,25 +247,31 @@ def selectable_indices(items: list[TreeItem]) -> list[int]:
 # ── fzf search ───────────────────────────────────────────────────
 
 
+def _clean_window_name(name: str) -> str:
+    """Strip (claude) and (codex) tags from window name."""
+    for tag in ("(claude)", "(codex)"):
+        name = name.replace(tag, "")
+    return name.strip()
+
+
 def fzf_search(items: list[TreeItem]) -> Window | None:
     windows = [it for it in items if it.kind == "window" and it.window]
     if not windows:
         return None
 
-    # Fields: pane_id \t session:index \t emoji+name \t dim session
-    # --with-nth=3,4 displays name + dim session
-    # --nth=3 searches only the window name
-    # --preview uses {1} (pane_id) to capture pane content
+    # Fields: pane_id \t session:index \t display
+    # --with-nth=3 shows only the formatted display
     dim = "\033[2m"
     reset = "\033[0m"
+    script = str(Path(__file__).resolve())
     fzf_lines = []
     for it in windows:
         w = it.window
-        emoji = ai_emoji(w)
-        fzf_lines.append(
-            f"{w.pane_id}\t{w.session}:{w.index}\t"
-            f"{emoji}{w.name}\t{dim}\u00b7  {w.session}{reset}"
-        )
+        emoji = ai_emoji(w).strip()  # e.g. "⚡" or ""
+        name = _clean_window_name(w.name)
+        suffix = f" {emoji}" if emoji else ""
+        display = f"{name}{suffix} {dim}{w.session}{reset}"
+        fzf_lines.append(f"{w.pane_id}\t{w.session}:{w.index}\t{display}")
     input_text = "\n".join(fzf_lines) + "\n"
 
     try:
@@ -273,9 +280,8 @@ def fzf_search(items: list[TreeItem]) -> Window | None:
                 "fzf", "--ansi", "--reverse",
                 "--header=Search windows",
                 "--delimiter=\t",
-                "--with-nth=3,4",
-                "--nth=3",
-                "--preview", "tmux capture-pane -e -t {1} -p | tail -50",
+                "--with-nth=3",
+                "--preview", f"{script} --preview {{1}}",
                 "--preview-window=right:60%",
             ],
             input=input_text, capture_output=True, text=True, check=False,
@@ -514,9 +520,45 @@ def ui(stdscr) -> None:
             return
 
 
+def preview_mode(pane_id: str) -> None:
+    """Output aligned preview for fzf's --preview command."""
+    # Look up window name from pane for AI detection
+    result = subprocess.run(
+        ["tmux", "display-message", "-t", pane_id, "-p", "#{window_name}"],
+        capture_output=True, text=True,
+    )
+    window_name = result.stdout.strip() if result.returncode == 0 else ""
+
+    content = capture_pane(pane_id)
+    if not content:
+        return
+
+    # Reuse the same alignment logic as the main view
+    is_ai = "(claude)" in window_name.lower() or "(codex)" in window_name.lower()
+    if is_ai:
+        bottom = True
+    else:
+        leading_blank = 0
+        for line in content:
+            if not ANSI_SGR_RE.sub("", line).strip():
+                leading_blank += 1
+            else:
+                break
+        bottom = leading_blank > len(content) * 0.4
+
+    lines = 50
+    output = content[-lines:] if bottom else content[:lines]
+    sys.stdout.write("\n".join(output) + "\n")
+
+
 def main() -> None:
     ensure_reasonable_path()
     locale.setlocale(locale.LC_ALL, "")
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
+        preview_mode(sys.argv[2])
+        return
+
     curses.wrapper(ui)
 
 
