@@ -251,19 +251,32 @@ def fzf_search(items: list[TreeItem]) -> Window | None:
     if not windows:
         return None
 
+    # Fields: pane_id \t session:index \t emoji+name \t dim session
+    # --with-nth=3,4 displays name + dim session
+    # --nth=3 searches only the window name
+    # --preview uses {1} (pane_id) to capture pane content
+    dim = "\033[2m"
+    reset = "\033[0m"
     fzf_lines = []
     for it in windows:
         w = it.window
         emoji = ai_emoji(w)
-        fzf_lines.append(f"{w.session}:{w.index}\t{emoji}{w.name}")
+        fzf_lines.append(
+            f"{w.pane_id}\t{w.session}:{w.index}\t"
+            f"{emoji}{w.name}\t{dim}\u00b7  {w.session}{reset}"
+        )
     input_text = "\n".join(fzf_lines) + "\n"
 
     try:
         result = subprocess.run(
             [
-                "fzf", "--reverse",
+                "fzf", "--ansi", "--reverse",
                 "--header=Search windows",
-                "--delimiter=\t", "--with-nth=1..",
+                "--delimiter=\t",
+                "--with-nth=3,4",
+                "--nth=3",
+                "--preview", "tmux capture-pane -e -t {1} -p | tail -50",
+                "--preview-window=right:60%",
             ],
             input=input_text, capture_output=True, text=True, check=False,
         )
@@ -273,7 +286,10 @@ def fzf_search(items: list[TreeItem]) -> Window | None:
     if result.returncode != 0 or not result.stdout.strip():
         return None
 
-    key = result.stdout.strip().split("\t")[0]  # "session:index"
+    parts = result.stdout.strip().split("\t")
+    if len(parts) < 2:
+        return None
+    key = parts[1]  # "session:index"
     for it in windows:
         w = it.window
         if f"{w.session}:{w.index}" == key:
