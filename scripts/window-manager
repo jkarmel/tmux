@@ -3,7 +3,7 @@
 
 Shows sessions with windows nested underneath. Sessions are non-selectable
 headers; j/k navigates only between windows. Preview panel on the right
-shows the bottom of the selected window's visible pane content.
+shows the selected window's pane content with ANSI colors preserved.
 Press / for fzf fuzzy search.
 """
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 import curses
 import locale
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -27,6 +28,13 @@ DEFAULT_PATH_SEGMENTS = [
     "/usr/sbin",
     "/sbin",
 ]
+
+# Predefined color pairs (1–4); dynamic pairs start at 5
+_FIXED_PAIRS = 4
+_color_pair_cache: dict[tuple[int, int], int] = {}
+_next_pair_id = _FIXED_PAIRS + 1
+
+ANSI_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
 
 
 # ── Utilities ────────────────────────────────────────────────────
@@ -123,15 +131,16 @@ def ai_emoji(window: Window) -> str:
 
 
 def capture_pane(pane_id: str) -> list[str]:
-    """Capture visible pane content, stripping trailing blank lines."""
+    """Capture visible pane content with ANSI colors, stripping trailing blanks."""
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", pane_id, "-p"],
+        ["tmux", "capture-pane", "-e", "-t", pane_id, "-p"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         return ["(unable to capture pane)"]
     content = result.stdout.rstrip("\n").split("\n")
-    while content and not content[-1].strip():
+    # Strip trailing blank lines (ignoring escape codes)
+    while content and not ANSI_SGR_RE.sub("", content[-1]).strip():
         content.pop()
     return content
 
@@ -145,7 +154,7 @@ def should_bottom_align(window: Window, content: list[str]) -> bool:
         return False
     leading_blank = 0
     for line in content:
-        if not line.strip():
+        if not ANSI_SGR_RE.sub("", line).strip():
             leading_blank += 1
         else:
             break
@@ -165,8 +174,12 @@ def build_tree(sessions: dict[str, list[Window]]) -> list[TreeItem]:
     items: list[TreeItem] = []
     for session_name, windows in sessions.items():
         items.append(TreeItem(kind="session", label=session_name))
+        has_ai = any(is_ai_window(w) for w in windows)
         for w in windows:
             emoji = ai_emoji(w)
+            # Pad non-AI windows to match emoji width (emoji = 2 display cells + 1 space)
+            if has_ai and not emoji:
+                emoji = "   "
             marker = "* " if w.is_current else "  "
             label = f"  {marker}{emoji}{w.index}: {w.name}"
             items.append(TreeItem(kind="window", label=label, window=w))
@@ -219,16 +232,164 @@ def fzf_search(items: list[TreeItem]) -> Window | None:
 
 
 def safe_addstr(win, y: int, x: int, text: str, max_width: int, attr: int = 0) -> None:
+    """Render plain text (no ANSI) with exact column control."""
     if max_width <= 0:
         return
     height, width = win.getmaxyx()
     if y < 0 or y >= height or x >= width:
         return
-    display = text[:max_width].ljust(max_width)
+    col = x
+    max_col = min(x + max_width, width)
+    for ch in text:
+        if col >= max_col:
+            break
+        if ch == "\t":
+            spaces = 8 - ((col - x) % 8)
+            for _ in range(min(spaces, max_col - col)):
+                try:
+                    win.addch(y, col, " ", attr)
+                except curses.error:
+                    return
+                col += 1
+        else:
+            try:
+                win.addch(y, col, ch, attr)
+            except curses.error:
+                return
+            col += 1
+    # Clear remaining columns
+    while col < max_col:
+        try:
+            win.addch(y, col, " ", attr)
+        except curses.error:
+            return
+        col += 1
+
+
+def _get_color_pair(fg: int, bg: int) -> int:
+    """Get or create a curses color pair for the given fg/bg."""
+    global _next_pair_id
+    key = (fg, bg)
+    if key in _color_pair_cache:
+        return _color_pair_cache[key]
     try:
-        win.addnstr(y, x, display, max_width, attr)
-    except curses.error:
-        pass
+        max_pairs = curses.COLOR_PAIRS
+    except AttributeError:
+        max_pairs = 256
+    if _next_pair_id >= max_pairs:
+        return 0
+    curses.init_pair(_next_pair_id, fg, bg)
+    _color_pair_cache[key] = _next_pair_id
+    _next_pair_id += 1
+    return _color_pair_cache[key]
+
+
+def render_ansi_line(
+    win, y: int, x: int, text: str, max_width: int,
+) -> None:
+    """Render a line containing ANSI SGR escape codes using curses colors."""
+    height, width = win.getmaxyx()
+    if y < 0 or y >= height or x >= width or max_width <= 0:
+        return
+    max_col = min(x + max_width, width)
+    col = x
+    fg, bg = -1, -1
+    bold = False
+    dim = False
+
+    pos = 0
+    while pos < len(text) and col < max_col:
+        m = ANSI_SGR_RE.match(text, pos)
+        if m:
+            params_str = m.group(1)
+            params = params_str.split(";") if params_str else ["0"]
+            i = 0
+            while i < len(params):
+                try:
+                    p = int(params[i])
+                except ValueError:
+                    i += 1
+                    continue
+                if p == 0:
+                    fg, bg, bold, dim = -1, -1, False, False
+                elif p == 1:
+                    bold = True
+                elif p == 2:
+                    dim = True
+                elif p == 22:
+                    bold, dim = False, False
+                elif 30 <= p <= 37:
+                    fg = p - 30
+                elif 40 <= p <= 47:
+                    bg = p - 40
+                elif 90 <= p <= 97:
+                    fg = p - 82  # maps to curses colors 8–15
+                elif 100 <= p <= 107:
+                    bg = p - 92
+                elif p == 38 and i + 2 < len(params):
+                    try:
+                        if int(params[i + 1]) == 5:
+                            fg = int(params[i + 2])
+                            i += 2
+                    except ValueError:
+                        pass
+                elif p == 48 and i + 2 < len(params):
+                    try:
+                        if int(params[i + 1]) == 5:
+                            bg = int(params[i + 2])
+                            i += 2
+                    except ValueError:
+                        pass
+                elif p == 39:
+                    fg = -1
+                elif p == 49:
+                    bg = -1
+                i += 1
+            pos = m.end()
+            continue
+
+        # Skip other escape sequences (cursor movement, etc.)
+        if text[pos] == "\033":
+            end = pos + 1
+            while end < len(text) and text[end] not in "ABCDEFGHJKSTfmnsulh":
+                end += 1
+            pos = end + 1 if end < len(text) else end
+            continue
+
+        ch = text[pos]
+        pos += 1
+
+        if ch == "\t":
+            spaces = 8 - ((col - x) % 8)
+            for _ in range(min(spaces, max_col - col)):
+                try:
+                    win.addch(y, col, " ")
+                except curses.error:
+                    return
+                col += 1
+            continue
+
+        attr = 0
+        pair_id = _get_color_pair(fg, bg)
+        if pair_id:
+            attr = curses.color_pair(pair_id)
+        if bold:
+            attr |= curses.A_BOLD
+        if dim:
+            attr |= curses.A_DIM
+        try:
+            win.addch(y, col, ch, attr)
+        except curses.error:
+            return
+        col += 1
+
+    # Clear remaining columns
+    while col < max_col:
+        try:
+            win.addch(y, col, " ")
+        except curses.error:
+            return
+        col += 1
 
 
 # ── Main UI ──────────────────────────────────────────────────────
@@ -346,7 +507,7 @@ def ui(stdscr) -> None:
                 row = start_row + i
                 if row >= tree_height:
                     break
-                safe_addstr(stdscr, row, preview_start, line, preview_width)
+                render_ansi_line(stdscr, row, preview_start, line, preview_width)
 
         # Draw help bar
         safe_addstr(
