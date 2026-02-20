@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 
 
@@ -35,6 +36,20 @@ _color_pair_cache: dict[tuple[int, int], int] = {}
 _next_pair_id = _FIXED_PAIRS + 1
 
 ANSI_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
+
+
+def _char_width(ch: str) -> int:
+    """Approximate terminal display width of a character."""
+    cp = ord(ch)
+    if cp < 0x300:
+        return 1
+    eaw = unicodedata.east_asian_width(ch)
+    if eaw in ("W", "F"):
+        return 2
+    # Emoji blocks that render as 2 cells in modern terminals
+    if 0x1F000 <= cp <= 0x1FFFF or 0x2600 <= cp <= 0x27BF:
+        return 2
+    return 1
 
 
 # ── Utilities ────────────────────────────────────────────────────
@@ -172,13 +187,14 @@ def switch_to_window(window: Window) -> None:
 
 def build_tree(sessions: dict[str, list[Window]]) -> list[TreeItem]:
     items: list[TreeItem] = []
+    has_any_ai = any(is_ai_window(w) for ws in sessions.values() for w in ws)
     for session_name, windows in sessions.items():
         items.append(TreeItem(kind="session", label=session_name))
-        has_ai = any(is_ai_window(w) for w in windows)
         for w in windows:
             emoji = ai_emoji(w)
-            # Pad non-AI windows to match emoji width (emoji = 2 display cells + 1 space)
-            if has_ai and not emoji:
+            # Pad all non-AI windows globally so numbers align across sessions
+            # Emoji = 2 display cells + 1 space = 3 display cells
+            if has_any_ai and not emoji:
                 emoji = "   "
             marker = "* " if w.is_current else "  "
             label = f"  {marker}{emoji}{w.index}: {w.name}"
@@ -241,8 +257,6 @@ def safe_addstr(win, y: int, x: int, text: str, max_width: int, attr: int = 0) -
     col = x
     max_col = min(x + max_width, width)
     for ch in text:
-        if col >= max_col:
-            break
         if ch == "\t":
             spaces = 8 - ((col - x) % 8)
             for _ in range(min(spaces, max_col - col)):
@@ -252,11 +266,14 @@ def safe_addstr(win, y: int, x: int, text: str, max_width: int, attr: int = 0) -
                     return
                 col += 1
         else:
+            cw = _char_width(ch)
+            if col + cw > max_col:
+                break
             try:
                 win.addch(y, col, ch, attr)
             except curses.error:
                 return
-            col += 1
+            col += cw
     # Clear remaining columns
     while col < max_col:
         try:
@@ -369,6 +386,9 @@ def render_ansi_line(
                 col += 1
             continue
 
+        cw = _char_width(ch)
+        if col + cw > max_col:
+            break
         attr = 0
         pair_id = _get_color_pair(fg, bg)
         if pair_id:
@@ -381,7 +401,7 @@ def render_ansi_line(
             win.addch(y, col, ch, attr)
         except curses.error:
             return
-        col += 1
+        col += cw
 
     # Clear remaining columns
     while col < max_col:
