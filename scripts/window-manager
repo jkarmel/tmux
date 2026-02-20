@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Custom tmux window manager with tree view and pane preview.
+
+Shows sessions with windows nested underneath. Sessions are non-selectable
+headers; j/k navigates only between windows. Preview panel on the right
+shows the bottom of the selected window's visible pane content.
+Press / for fzf fuzzy search.
+"""
+
+from __future__ import annotations
+
+import curses
+import locale
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+
+
+# ── Constants ────────────────────────────────────────────────────
+
+DEFAULT_PATH_SEGMENTS = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+]
+
+
+# ── Utilities ────────────────────────────────────────────────────
+
+
+def ensure_reasonable_path() -> None:
+    current = os.environ.get("PATH", "")
+    parts = [p for p in current.split(":") if p]
+    for seg in DEFAULT_PATH_SEGMENTS:
+        if seg not in parts:
+            parts.append(seg)
+    os.environ["PATH"] = ":".join(parts)
+
+
+# ── Data Model ───────────────────────────────────────────────────
+
+
+@dataclass
+class Window:
+    session: str
+    index: int
+    name: str
+    pane_id: str
+    ai_status: str
+    is_current: bool
+
+
+@dataclass
+class TreeItem:
+    kind: str  # "session" or "window"
+    label: str
+    window: Window | None = None
+
+
+# ── tmux helpers ─────────────────────────────────────────────────
+
+
+def get_current_target() -> str:
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "#{session_name}:#{window_index}"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def get_windows() -> dict[str, list[Window]]:
+    """Return windows grouped by session name (insertion-ordered)."""
+    current = get_current_target()
+    result = subprocess.run(
+        [
+            "tmux", "list-windows", "-a", "-F",
+            "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{@ai_status}",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return {}
+
+    sessions: dict[str, list[Window]] = {}
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        session, idx, name, pane_id = parts[0], parts[1], parts[2], parts[3]
+        ai_status = parts[4] if len(parts) > 4 else ""
+        target = f"{session}:{idx}"
+        w = Window(
+            session=session,
+            index=int(idx),
+            name=name,
+            pane_id=pane_id,
+            ai_status=ai_status,
+            is_current=(target == current),
+        )
+        sessions.setdefault(session, []).append(w)
+    return sessions
+
+
+def ai_emoji(window: Window) -> str:
+    name = window.name.lower()
+    if "(claude)" in name or "(codex)" in name:
+        if window.ai_status == "active":
+            return "\u26a1 "  # lightning
+        if window.ai_status == "done":
+            return "\u2705 "  # check
+        return "\U0001f916 "  # robot
+    return ""
+
+
+def capture_pane_bottom(pane_id: str, lines: int) -> list[str]:
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", pane_id, "-p"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return ["(unable to capture pane)"]
+    content = result.stdout.rstrip("\n").split("\n")
+    # Strip trailing blank lines
+    while content and not content[-1].strip():
+        content.pop()
+    return content[-lines:] if len(content) > lines else content
+
+
+def switch_to_window(window: Window) -> None:
+    target = f"{window.session}:{window.index}"
+    subprocess.run(["tmux", "select-window", "-t", target], check=False)
+    subprocess.run(["tmux", "switch-client", "-t", window.session], check=False)
+
+
+# ── Tree building ────────────────────────────────────────────────
+
+
+def build_tree(sessions: dict[str, list[Window]]) -> list[TreeItem]:
+    items: list[TreeItem] = []
+    for session_name, windows in sessions.items():
+        items.append(TreeItem(kind="session", label=session_name))
+        for w in windows:
+            emoji = ai_emoji(w)
+            marker = "* " if w.is_current else "  "
+            label = f"  {marker}{emoji}{w.index}: {w.name}"
+            items.append(TreeItem(kind="window", label=label, window=w))
+    return items
+
+
+def selectable_indices(items: list[TreeItem]) -> list[int]:
+    return [i for i, item in enumerate(items) if item.kind == "window"]
+
+
+# ── fzf search ───────────────────────────────────────────────────
+
+
+def fzf_search(items: list[TreeItem]) -> Window | None:
+    windows = [it for it in items if it.kind == "window" and it.window]
+    if not windows:
+        return None
+
+    fzf_lines = []
+    for it in windows:
+        w = it.window
+        emoji = ai_emoji(w)
+        fzf_lines.append(f"{w.session}:{w.index}\t{emoji}{w.name}")
+    input_text = "\n".join(fzf_lines) + "\n"
+
+    try:
+        result = subprocess.run(
+            [
+                "fzf", "--reverse",
+                "--header=Search windows",
+                "--delimiter=\t", "--with-nth=1..",
+            ],
+            input=input_text, capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return None
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+
+    key = result.stdout.strip().split("\t")[0]  # "session:index"
+    for it in windows:
+        w = it.window
+        if f"{w.session}:{w.index}" == key:
+            return w
+    return None
+
+
+# ── Curses rendering helpers ─────────────────────────────────────
+
+
+def safe_addstr(win, y: int, x: int, text: str, max_width: int, attr: int = 0) -> None:
+    if max_width <= 0:
+        return
+    height, width = win.getmaxyx()
+    if y < 0 or y >= height or x >= width:
+        return
+    display = text[:max_width].ljust(max_width)
+    try:
+        win.addnstr(y, x, display, max_width, attr)
+    except curses.error:
+        pass
+
+
+# ── Main UI ──────────────────────────────────────────────────────
+
+
+def ui(stdscr) -> None:
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(3, curses.COLOR_WHITE, -1)
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+
+    sessions = get_windows()
+    if not sessions:
+        return
+
+    items = build_tree(sessions)
+    sel_indices = selectable_indices(items)
+    if not sel_indices:
+        return
+
+    # Default to current window
+    selected = 0
+    for i, idx in enumerate(sel_indices):
+        w = items[idx].window
+        if w and w.is_current:
+            selected = i
+            break
+
+    scroll_offset = 0
+    last_pane_id: str | None = None
+    preview_cache: list[str] = []
+
+    # 1000ms timeout: keys are instant, preview refreshes every ~1s when idle
+    stdscr.timeout(1000)
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        list_width = max(width * 35 // 100, 20)
+        preview_start = list_width + 2
+        preview_width = width - preview_start - 1
+        help_row = height - 1
+        tree_height = help_row
+
+        # Keep selection visible
+        sel_tree_idx = sel_indices[selected]
+        if sel_tree_idx < scroll_offset:
+            scroll_offset = sel_tree_idx
+        if sel_tree_idx >= scroll_offset + tree_height:
+            scroll_offset = sel_tree_idx - tree_height + 1
+
+        # Also try to show the session header above the first window
+        if scroll_offset > 0:
+            for look_back in range(sel_tree_idx - 1, -1, -1):
+                if items[look_back].kind == "session":
+                    if look_back < scroll_offset:
+                        scroll_offset = look_back
+                    break
+
+        # Capture preview
+        sel_window = items[sel_indices[selected]].window
+        if sel_window:
+            if sel_window.pane_id != last_pane_id:
+                last_pane_id = sel_window.pane_id
+                preview_cache = capture_pane_bottom(sel_window.pane_id, tree_height)
+
+        stdscr.erase()
+
+        # Draw tree
+        for row in range(tree_height):
+            tree_idx = scroll_offset + row
+            if tree_idx >= len(items):
+                break
+            item = items[tree_idx]
+            if item.kind == "session":
+                safe_addstr(
+                    stdscr, row, 0, f" {item.label}",
+                    list_width, curses.color_pair(1) | curses.A_BOLD,
+                )
+            else:
+                is_sel = tree_idx == sel_indices[selected]
+                attr = curses.color_pair(2) if is_sel else curses.color_pair(3)
+                safe_addstr(stdscr, row, 0, item.label, list_width, attr)
+
+        # Draw separator
+        for row in range(tree_height):
+            try:
+                stdscr.addch(row, list_width, curses.ACS_VLINE, curses.color_pair(1))
+            except curses.error:
+                pass
+
+        # Draw preview (bottom-aligned)
+        if preview_width > 0 and preview_cache:
+            start_row = max(0, tree_height - len(preview_cache))
+            for i, line in enumerate(preview_cache):
+                row = start_row + i
+                if row >= tree_height:
+                    break
+                safe_addstr(stdscr, row, preview_start, line, preview_width)
+
+        # Draw help bar
+        safe_addstr(
+            stdscr, help_row, 0,
+            " j/k:nav  Enter:switch  /:search  q:quit",
+            width, curses.color_pair(4) | curses.A_DIM,
+        )
+
+        stdscr.refresh()
+
+        # Input
+        key = stdscr.getch()
+
+        if key == -1:
+            # Timeout — refresh preview for live updates
+            if sel_window:
+                preview_cache = capture_pane_bottom(sel_window.pane_id, tree_height)
+            continue
+
+        if key in (ord("j"), curses.KEY_DOWN):
+            if selected < len(sel_indices) - 1:
+                selected += 1
+                last_pane_id = None
+
+        elif key in (ord("k"), curses.KEY_UP):
+            if selected > 0:
+                selected -= 1
+                last_pane_id = None
+
+        elif key in (ord("\n"), ord("\r")):
+            window = items[sel_indices[selected]].window
+            if window:
+                switch_to_window(window)
+            return
+
+        elif key == ord("/"):
+            curses.endwin()
+            result = fzf_search(items)
+            if result:
+                switch_to_window(result)
+                return
+            # Restore curses
+            stdscr.refresh()
+            last_pane_id = None
+
+        elif key in (ord("q"), 27):  # q or Esc
+            return
+
+
+def main() -> None:
+    ensure_reasonable_path()
+    locale.setlocale(locale.LC_ALL, "")
+    curses.wrapper(ui)
+
+
+if __name__ == "__main__":
+    main()
