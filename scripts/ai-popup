@@ -73,19 +73,21 @@ def run_command(
 # ── Directory and File Discovery ─────────────────────────────────
 
 
-def get_repo_root() -> Path | None:
+def get_pane_dir() -> Path:
     result = run_command(
         ["tmux", "display-message", "-p", "#{pane_current_path}"]
     )
-    start_dir = None
     if result.returncode == 0:
         text = result.stdout.strip()
         if text:
             path = Path(text)
             if path.is_dir():
-                start_dir = path
-    if start_dir is None:
-        start_dir = Path.cwd()
+                return path
+    return Path.cwd()
+
+
+def get_repo_root() -> Path | None:
+    start_dir = get_pane_dir()
 
     git_result = run_command(
         ["git", "-C", str(start_dir), "rev-parse", "--show-toplevel"]
@@ -94,6 +96,62 @@ def get_repo_root() -> Path | None:
         return None
     root = Path(git_result.stdout.strip())
     return root if root.is_dir() else None
+
+
+def has_commits(repo_root: Path) -> bool:
+    result = run_command(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
+    return result.returncode == 0
+
+
+def confirm(prompt: str) -> bool:
+    try:
+        answer = input(f"{prompt} [y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes")
+
+
+def ensure_git_ready() -> Path | None:
+    """Ensure pane directory is in a git repo with at least one commit.
+
+    Offers to create the repo and/or initial commit if missing.
+    Returns the repo root, or None if the user declines.
+    """
+    pane_dir = get_pane_dir()
+    repo_root = get_repo_root()
+
+    if repo_root is None:
+        print(f"No git repository found in {pane_dir}")
+        print("A git repo is required for worktree isolation.")
+        print("")
+        if not confirm(f"Initialize a git repository in {pane_dir}?"):
+            return None
+        result = run_command(["git", "init", str(pane_dir)])
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout).strip()
+            die(f"git init failed: {details}")
+        repo_root = get_repo_root()
+        if repo_root is None:
+            die("git init succeeded but repository not found")
+        print(f"Initialized git repository in {repo_root}")
+        print("")
+
+    if not has_commits(repo_root):
+        print("Git repository has no commits.")
+        print("At least one commit is required for worktree isolation.")
+        print("")
+        if not confirm("Create an initial commit?"):
+            return None
+        result = run_command(
+            ["git", "-C", str(repo_root), "commit", "--allow-empty", "-m", "Initial commit"]
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout).strip()
+            die(f"Failed to create initial commit: {details}")
+        print("Created initial commit.")
+        print("")
+
+    return repo_root
 
 
 def list_todos(repo_root: Path) -> list[str]:
@@ -212,7 +270,9 @@ def main() -> int:
         if not AI_LAUNCH.is_file():
             die(f"Missing ai-launch script: {AI_LAUNCH}")
 
-        repo_root = get_repo_root()
+        repo_root = ensure_git_ready()
+        if repo_root is None:
+            return 0
 
         # Step 1: pick agent
         agent = step_pick_agent()
