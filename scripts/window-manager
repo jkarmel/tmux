@@ -5,6 +5,9 @@ Shows sessions with windows nested underneath. Sessions are non-selectable
 headers; j/k navigates only between windows. Preview panel on the right
 shows the selected window's pane content with ANSI colors preserved.
 Press / for fzf fuzzy search.
+
+Pass --session for a session-focused view that shows one session at a time
+with h/l keys to cycle between sessions.
 """
 
 from __future__ import annotations
@@ -240,6 +243,20 @@ def build_tree(sessions: dict[str, list[Window]]) -> list[TreeItem]:
     return items
 
 
+def build_session_tree(windows: list[Window]) -> list[TreeItem]:
+    """Build tree for a single session (windows only, no session headers)."""
+    items: list[TreeItem] = []
+    has_any_ai = any(is_ai_window(w) for w in windows)
+    for w in windows:
+        emoji = ai_emoji(w)
+        if has_any_ai and not emoji:
+            emoji = "   "
+        marker = "* " if w.is_current else "  "
+        label = f"  {marker}{emoji}{w.index}: {w.name}"
+        items.append(TreeItem(kind="window", label=label, window=w))
+    return items
+
+
 def selectable_indices(items: list[TreeItem]) -> list[int]:
     return [i for i, item in enumerate(items) if item.kind == "window"]
 
@@ -340,6 +357,34 @@ def safe_addstr(win, y: int, x: int, text: str, max_width: int, attr: int = 0) -
         except curses.error:
             return
         col += 1
+
+
+def render_preview(window: Window | None, content: list[str],
+                   col: int, width: int, rows: int) -> None:
+    """Render pane preview with raw ANSI escape codes after curses refresh.
+
+    Bypasses curses color handling entirely so the terminal renders the
+    exact escape sequences from capture-pane -e (pixel-perfect colors).
+    """
+    if width <= 0 or not content or not window:
+        return
+    if should_bottom_align(window, content):
+        visible = content[-rows:]
+        start_row = max(0, rows - len(visible))
+    else:
+        visible = content[:rows]
+        start_row = 0
+    buf: list[str] = []
+    for i, line in enumerate(visible):
+        row = start_row + i
+        if row >= rows:
+            break
+        truncated = _truncate_ansi(line, width)
+        # ANSI cursor positioning is 1-based
+        buf.append(f"\033[{row + 1};{col + 1}H{truncated}")
+    buf.append("\033[0m")
+    sys.stdout.write("".join(buf))
+    sys.stdout.flush()
 
 
 # ── Main UI ──────────────────────────────────────────────────────
@@ -458,28 +503,9 @@ def ui(stdscr) -> None:
         stdscr.clearok(True)
         stdscr.refresh()
 
-        # Draw preview with raw ANSI escape codes AFTER curses refresh.
-        # This bypasses curses color handling entirely — the terminal
-        # renders the exact same escape sequences from capture-pane -e,
-        # so colors are pixel-perfect.
-        if preview_width > 0 and preview_cache and sel_window:
-            if should_bottom_align(sel_window, preview_cache):
-                visible = preview_cache[-tree_height:]
-                start_row = max(0, tree_height - len(visible))
-            else:
-                visible = preview_cache[:tree_height]
-                start_row = 0
-            buf: list[str] = []
-            for i, line in enumerate(visible):
-                row = start_row + i
-                if row >= tree_height:
-                    break
-                truncated = _truncate_ansi(line, preview_width)
-                # ANSI cursor positioning is 1-based
-                buf.append(f"\033[{row + 1};{preview_start + 1}H{truncated}")
-            buf.append("\033[0m")
-            sys.stdout.write("".join(buf))
-            sys.stdout.flush()
+        # Draw preview — raw ANSI bypasses curses for pixel-perfect colors
+        render_preview(sel_window, preview_cache,
+                       preview_start, preview_width, tree_height)
 
         # Input
         key = stdscr.getch()
@@ -513,6 +539,178 @@ def ui(stdscr) -> None:
                 switch_to_window(result)
                 return
             # Restore curses
+            stdscr.refresh()
+            last_pane_id = None
+
+        elif key in (ord("q"), 27):  # q or Esc
+            return
+
+
+# ── Session-focused UI ───────────────────────────────────────────
+
+
+def session_ui(stdscr) -> None:
+    """Session-focused window browser with h/l to cycle sessions."""
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(3, curses.COLOR_WHITE, -1)
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+
+    sessions = get_windows()
+    if not sessions:
+        return
+
+    session_names = list(sessions.keys())
+    if not session_names:
+        return
+
+    # Start on the current session
+    current_target = get_current_target()
+    cur_session = current_target.split(":")[0] if ":" in current_target else ""
+    session_idx = 0
+    for i, name in enumerate(session_names):
+        if name == cur_session:
+            session_idx = i
+            break
+
+    selected = 0
+    items: list[TreeItem] = []
+    sel_indices: list[int] = []
+
+    def rebuild() -> None:
+        nonlocal items, sel_indices, selected
+        items = build_session_tree(sessions[session_names[session_idx]])
+        sel_indices = selectable_indices(items)
+        selected = 0
+        for i, idx in enumerate(sel_indices):
+            w = items[idx].window
+            if w and w.is_current:
+                selected = i
+                break
+
+    rebuild()
+    if not sel_indices:
+        return
+
+    scroll_offset = 0
+    last_pane_id: str | None = None
+    preview_cache: list[str] = []
+
+    stdscr.timeout(1000)
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        list_width = max(width * 35 // 100, 20)
+        preview_start = list_width + 2
+        preview_width = width - preview_start - 1
+        help_row = height - 1
+        tree_start = 1  # row 0 is the session header
+        tree_height = help_row - tree_start
+
+        # Keep selection visible
+        if sel_indices:
+            sel_tree_idx = sel_indices[selected]
+            if sel_tree_idx < scroll_offset:
+                scroll_offset = sel_tree_idx
+            if sel_tree_idx >= scroll_offset + tree_height:
+                scroll_offset = sel_tree_idx - tree_height + 1
+
+        # Capture preview
+        sel_window = items[sel_indices[selected]].window if sel_indices else None
+        if sel_window:
+            if sel_window.pane_id != last_pane_id:
+                last_pane_id = sel_window.pane_id
+                preview_cache = capture_pane(sel_window.pane_id)
+
+        stdscr.erase()
+
+        # Session header with navigation arrows
+        name = session_names[session_idx]
+        n = len(session_names)
+        header = f" \u25c0 {name} \u25b6  ({session_idx + 1}/{n})"
+        safe_addstr(stdscr, 0, 0, header, list_width,
+                    curses.color_pair(1) | curses.A_BOLD)
+
+        # Window list
+        for row in range(tree_height):
+            item_idx = scroll_offset + row
+            if item_idx >= len(items):
+                break
+            item = items[item_idx]
+            is_sel = sel_indices and item_idx == sel_indices[selected]
+            attr = curses.color_pair(2) if is_sel else curses.color_pair(3)
+            safe_addstr(stdscr, tree_start + row, 0, item.label,
+                        list_width, attr)
+
+        # Separator
+        for row in range(help_row):
+            try:
+                stdscr.addch(row, list_width, curses.ACS_VLINE,
+                             curses.color_pair(1))
+            except curses.error:
+                pass
+
+        # Help bar
+        safe_addstr(
+            stdscr, help_row, 0,
+            " j/k:nav  h/l:session  Enter:switch  /:search  q:quit",
+            width, curses.color_pair(4) | curses.A_DIM,
+        )
+
+        stdscr.clearok(True)
+        stdscr.refresh()
+
+        # Draw preview — full height (above help bar)
+        render_preview(sel_window, preview_cache,
+                       preview_start, preview_width, help_row)
+
+        # Input
+        key = stdscr.getch()
+
+        if key == -1:
+            if sel_window:
+                preview_cache = capture_pane(sel_window.pane_id)
+            continue
+
+        if key in (ord("j"), curses.KEY_DOWN):
+            if sel_indices and selected < len(sel_indices) - 1:
+                selected += 1
+                last_pane_id = None
+
+        elif key in (ord("k"), curses.KEY_UP):
+            if selected > 0:
+                selected -= 1
+                last_pane_id = None
+
+        elif key in (ord("l"), curses.KEY_RIGHT):
+            # Next session
+            session_idx = (session_idx + 1) % len(session_names)
+            scroll_offset = 0
+            last_pane_id = None
+            rebuild()
+
+        elif key in (ord("h"), curses.KEY_LEFT):
+            # Previous session
+            session_idx = (session_idx - 1) % len(session_names)
+            scroll_offset = 0
+            last_pane_id = None
+            rebuild()
+
+        elif key in (ord("\n"), ord("\r")):
+            if sel_indices:
+                window = items[sel_indices[selected]].window
+                if window:
+                    switch_to_window(window)
+            return
+
+        elif key == ord("/"):
+            curses.endwin()
+            result = fzf_search(items)
+            if result:
+                switch_to_window(result)
+                return
             stdscr.refresh()
             last_pane_id = None
 
@@ -557,6 +755,10 @@ def main() -> None:
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         preview_mode(sys.argv[2])
+        return
+
+    if "--session" in sys.argv:
+        curses.wrapper(session_ui)
         return
 
     curses.wrapper(ui)
