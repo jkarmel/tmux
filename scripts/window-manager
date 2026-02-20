@@ -35,10 +35,9 @@ _FIXED_PAIRS = 4
 _color_pair_cache: dict[tuple[int, int], int] = {}
 _next_pair_id = _FIXED_PAIRS + 1
 
-# Custom RGB colors start after the standard 256 palette
+# Custom RGB colors reuse extended palette slots (16–255), avoiding 0–15
 _custom_color_cache: dict[tuple[int, int, int], int] = {}
-_next_color_id = 256
-_can_change: bool | None = None  # resolved at runtime
+_next_color_id = 16
 
 # Match SGR sequences with ; or : separators (tmux uses : for ISO 8613-6)
 ANSI_SGR_RE = re.compile(r"\033\[([0-9;:]*)m")
@@ -61,21 +60,28 @@ def _rgb_to_256(r: int, g: int, b: int) -> int:
 def _get_rgb_color(r: int, g: int, b: int) -> int:
     """Get a curses color index for an exact RGB value.
 
-    Uses init_color to define custom colors when the terminal supports it,
-    falling back to the nearest 256-color approximation otherwise.
+    Tries init_color regardless of can_change_color (tmux/screen terminfo
+    often reports False even though the underlying terminal supports it).
+    Falls back to nearest 256-color approximation on failure.
     """
-    global _next_color_id, _can_change
-    if _can_change is None:
-        _can_change = curses.can_change_color()
+    global _next_color_id
     key = (r, g, b)
     if key in _custom_color_cache:
         return _custom_color_cache[key]
-    if not _can_change or _next_color_id >= curses.COLORS:
-        return _rgb_to_256(r, g, b)
-    curses.init_color(_next_color_id, r * 1000 // 255, g * 1000 // 255, b * 1000 // 255)
-    _custom_color_cache[key] = _next_color_id
-    _next_color_id += 1
-    return _custom_color_cache[key]
+    if _next_color_id < curses.COLORS:
+        try:
+            curses.init_color(
+                _next_color_id,
+                r * 1000 // 255,
+                g * 1000 // 255,
+                b * 1000 // 255,
+            )
+            _custom_color_cache[key] = _next_color_id
+            _next_color_id += 1
+            return _custom_color_cache[key]
+        except curses.error:
+            pass
+    return _rgb_to_256(r, g, b)
 
 
 def _char_width(ch: str) -> int:
