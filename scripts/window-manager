@@ -120,6 +120,7 @@ class TreeItem:
     kind: str  # "session" or "window"
     label: str
     window: Window | None = None
+    hotkey: str | None = None
 
 
 # ── tmux helpers ─────────────────────────────────────────────────
@@ -214,6 +215,13 @@ def should_bottom_align(window: Window, content: list[str]) -> bool:
     return leading_blank > len(content) * 0.4
 
 
+def _clean_window_name(name: str) -> str:
+    """Strip (claude) and (codex) tags from window name."""
+    for tag in ("(claude)", "(codex)"):
+        name = name.replace(tag, "")
+    return name.strip()
+
+
 def switch_to_window(window: Window) -> None:
     target = f"{window.session}:{window.index}"
     subprocess.run(["tmux", "select-window", "-t", target], check=False)
@@ -223,21 +231,29 @@ def switch_to_window(window: Window) -> None:
 # ── Tree building ────────────────────────────────────────────────
 
 
-def build_tree(sessions: dict[str, list[Window]]) -> list[TreeItem]:
+# Hotkey letters — skip j/k (nav), q (quit)
+HOTKEY_POOL = "abcdefghilmnoprstuvwxyz"
+
+
+def build_tree(
+    sessions: dict[str, list[Window]],
+) -> tuple[list[TreeItem], dict[str, Window]]:
     items: list[TreeItem] = []
-    has_any_ai = any(is_ai_window(w) for ws in sessions.values() for w in ws)
+    hotkey_map: dict[str, Window] = {}
+    hotkey_idx = 0
     for session_name, windows in sessions.items():
         items.append(TreeItem(kind="session", label=session_name))
         for w in windows:
-            emoji = ai_emoji(w)
-            # Pad all non-AI windows globally so numbers align across sessions
-            # Emoji = 2 display cells + 1 space = 3 display cells
-            if has_any_ai and not emoji:
-                emoji = "   "
-            marker = "* " if w.is_current else "  "
-            label = f"  {marker}{emoji}{w.index}: {w.name}"
-            items.append(TreeItem(kind="window", label=label, window=w))
-    return items
+            name = _clean_window_name(w.name)
+            emoji = ai_emoji(w).strip()
+            suffix = f" {emoji}" if emoji else ""
+            label = f"{name}{suffix}"
+            hotkey = HOTKEY_POOL[hotkey_idx] if hotkey_idx < len(HOTKEY_POOL) else None
+            if hotkey:
+                hotkey_map[hotkey] = w
+                hotkey_idx += 1
+            items.append(TreeItem(kind="window", label=label, window=w, hotkey=hotkey))
+    return items, hotkey_map
 
 
 def selectable_indices(items: list[TreeItem]) -> list[int]:
@@ -245,13 +261,6 @@ def selectable_indices(items: list[TreeItem]) -> list[int]:
 
 
 # ── fzf search ───────────────────────────────────────────────────
-
-
-def _clean_window_name(name: str) -> str:
-    """Strip (claude) and (codex) tags from window name."""
-    for tag in ("(claude)", "(codex)"):
-        name = name.replace(tag, "")
-    return name.strip()
 
 
 def fzf_search(items: list[TreeItem]) -> Window | None:
@@ -348,16 +357,17 @@ def safe_addstr(win, y: int, x: int, text: str, max_width: int, attr: int = 0) -
 def ui(stdscr) -> None:
     curses.curs_set(0)
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)
-    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
-    curses.init_pair(3, curses.COLOR_WHITE, -1)
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+    curses.init_pair(1, curses.COLOR_CYAN, -1)       # session headers
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected
+    curses.init_pair(3, curses.COLOR_WHITE, -1)      # normal window
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)     # help bar
+    curses.init_pair(5, curses.COLOR_CYAN, -1)       # dim hotkey letter
 
     sessions = get_windows()
     if not sessions:
         return
 
-    items = build_tree(sessions)
+    items, hotkey_map = build_tree(sessions)
     sel_indices = selectable_indices(items)
     if not sel_indices:
         return
@@ -423,6 +433,7 @@ def ui(stdscr) -> None:
             tree_start_row = 1
 
         # Draw tree
+        name_col = 2  # column where window names start (after "a ")
         for row in range(tree_start_row, tree_height):
             tree_idx = scroll_offset + (row - tree_start_row)
             if tree_idx >= len(items):
@@ -430,13 +441,20 @@ def ui(stdscr) -> None:
             item = items[tree_idx]
             if item.kind == "session":
                 safe_addstr(
-                    stdscr, row, 0, f" {item.label}",
+                    stdscr, row, 0, item.label,
                     list_width, curses.color_pair(1) | curses.A_BOLD,
                 )
             else:
+                # Dim hotkey letter
+                if item.hotkey:
+                    safe_addstr(
+                        stdscr, row, 0, item.hotkey,
+                        1, curses.color_pair(5) | curses.A_DIM,
+                    )
+                # Window name + emoji
                 is_sel = tree_idx == sel_indices[selected]
                 attr = curses.color_pair(2) if is_sel else curses.color_pair(3)
-                safe_addstr(stdscr, row, 0, item.label, list_width, attr)
+                safe_addstr(stdscr, row, name_col, item.label, list_width - name_col, attr)
 
         # Draw separator
         for row in range(tree_height):
@@ -448,7 +466,7 @@ def ui(stdscr) -> None:
         # Draw help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " j/k:nav  Enter:switch  /:search  q:quit",
+            " a-z:jump  j/k:nav  /:search  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -518,6 +536,12 @@ def ui(stdscr) -> None:
 
         elif key in (ord("q"), 27):  # q or Esc
             return
+
+        elif 0x20 <= key <= 0x7E:
+            ch = chr(key)
+            if ch in hotkey_map:
+                switch_to_window(hotkey_map[ch])
+                return
 
 
 def preview_mode(pane_id: str) -> None:
