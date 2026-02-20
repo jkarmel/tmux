@@ -163,6 +163,14 @@ def resolve_agent_cwd(
     return worktree_path
 
 
+def symlink_env_file(repo_root: Path, worktree_path: Path) -> None:
+    env_file = repo_root / ".env"
+    if env_file.is_file():
+        target = worktree_path / ".env"
+        if not target.exists():
+            target.symlink_to(env_file)
+
+
 def cleanup_worktree(
     repo_root: Path, worktree_path: Path, branch_name: str
 ) -> list[str]:
@@ -532,6 +540,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
     # Create worktree
     branch_name, worktree_path = make_worktree_identity(name, repo_root)
     create_worktree(repo_root, target_revision, branch_name, worktree_path)
+    symlink_env_file(repo_root, worktree_path)
 
     # Build internal command
     window_name = f"{name} ({args.agent})"
