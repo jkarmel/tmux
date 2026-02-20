@@ -197,7 +197,7 @@ def run_agent_interactive(agent: str, cwd: Path) -> int:
     if agent == "claude":
         cmd = ["claude", "--dangerously-skip-permissions"]
     elif agent == "codex":
-        cmd = ["codex", "--full-auto"]
+        cmd = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
     else:
         cmd = ["bash", "-c", agent]
     result = subprocess.run(cmd, cwd=cwd, check=False)
