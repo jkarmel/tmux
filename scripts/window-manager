@@ -8,6 +8,9 @@ Press / for fzf fuzzy search.
 
 Pass --session for a session-focused view that shows one session at a time
 with h/l keys to cycle between sessions.
+
+Pass --sessions for a session list view that shows all sessions with their
+working directories on the left and a compact window list preview on the right.
 """
 
 from __future__ import annotations
@@ -126,6 +129,14 @@ class TreeItem:
     hotkey: str | None = None
 
 
+@dataclass
+class Session:
+    name: str
+    path: str           # working directory from tmux session_path
+    windows: list[Window]
+    is_current: bool
+
+
 # ── tmux helpers ─────────────────────────────────────────────────
 
 
@@ -169,6 +180,41 @@ def get_windows() -> dict[str, list[Window]]:
             is_current=(target == current),
         )
         sessions.setdefault(session, []).append(w)
+    return sessions
+
+
+def get_sessions() -> list[Session]:
+    """Return all sessions with their paths and windows."""
+    current_target = get_current_target()
+    cur_session = current_target.split(":")[0] if ":" in current_target else ""
+
+    # Get session paths
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}\t#{session_path}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    session_paths: dict[str, str] = {}
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            session_paths[parts[0]] = parts[1]
+
+    windows_by_session = get_windows()
+
+    sessions: list[Session] = []
+    for name, windows in windows_by_session.items():
+        path = session_paths.get(name, "")
+        sessions.append(Session(
+            name=name,
+            path=path,
+            windows=windows,
+            is_current=(name == cur_session),
+        ))
     return sessions
 
 
@@ -223,6 +269,19 @@ def _clean_window_name(name: str) -> str:
     for tag in ("(claude)", "(codex)"):
         name = name.replace(tag, "")
     return name.strip()
+
+
+def _abbreviate_path(path: str) -> str:
+    """Abbreviate home dir to ~ for display."""
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+def switch_to_session(session_name: str) -> None:
+    """Switch to a session's active window."""
+    subprocess.run(["tmux", "switch-client", "-t", session_name], check=False)
 
 
 def switch_to_window(window: Window) -> None:
@@ -766,6 +825,163 @@ def session_ui(stdscr) -> None:
                 return
 
 
+# ── Session list UI ───────────────────────────────────────────
+
+
+def sessions_ui(stdscr) -> None:
+    """Session list browser with window list preview."""
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)       # headers
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected
+    curses.init_pair(3, curses.COLOR_WHITE, -1)      # normal
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)     # help bar
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)    # hotkey letter
+
+    all_sessions = get_sessions()
+    if not all_sessions:
+        return
+
+    pool = HOTKEY_POOL  # "abcdefghilmnoprstuvwxyz"
+    hotkey_map: dict[str, Session] = {}
+    for i, sess in enumerate(all_sessions):
+        if i < len(pool):
+            hotkey_map[pool[i]] = sess
+
+    # Pre-select current session
+    selected = 0
+    for i, sess in enumerate(all_sessions):
+        if sess.is_current:
+            selected = i
+            break
+
+    scroll_offset = 0
+    stdscr.timeout(1000)
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        list_width = max(width * 35 // 100, 20)
+        preview_start = list_width + 2
+        preview_width = width - preview_start - 1
+        help_row = height - 1
+        list_height = help_row
+        name_col = 2
+
+        # Keep selection visible
+        if selected < scroll_offset:
+            scroll_offset = selected
+        if selected >= scroll_offset + list_height:
+            scroll_offset = selected - list_height + 1
+
+        stdscr.erase()
+
+        # ── Left panel: session list ──
+        for row in range(list_height):
+            sess_idx = scroll_offset + row
+            if sess_idx >= len(all_sessions):
+                break
+            sess = all_sessions[sess_idx]
+            is_sel = (sess_idx == selected)
+
+            # Hotkey letter
+            if sess_idx < len(pool):
+                safe_addstr(
+                    stdscr, row, 0, pool[sess_idx],
+                    1, curses.color_pair(5) | curses.A_BOLD,
+                )
+
+            # Session name
+            name_attr = curses.color_pair(2) if is_sel else curses.color_pair(3)
+            safe_addstr(stdscr, row, name_col, sess.name, list_width - name_col, name_attr)
+
+            # Working dir (dimmed) after the name
+            path_display = _abbreviate_path(sess.path)
+            name_end = name_col + len(sess.name) + 1
+            remaining = list_width - name_end
+            if remaining > 4:
+                path_attr = curses.color_pair(2) | curses.A_DIM if is_sel else curses.A_DIM
+                safe_addstr(stdscr, row, name_end, path_display, remaining, path_attr)
+
+        # ── Separator ──
+        for row in range(help_row):
+            try:
+                stdscr.addch(row, list_width, curses.ACS_VLINE, curses.color_pair(1))
+            except curses.error:
+                pass
+
+        # ── Right panel: window list for highlighted session ──
+        highlighted = all_sessions[selected]
+        preview_row = 0
+
+        # Header
+        safe_addstr(stdscr, preview_row, preview_start, highlighted.name,
+                    preview_width, curses.color_pair(1) | curses.A_BOLD)
+        preview_row += 1
+
+        # Underline
+        separator_len = min(preview_width, len(highlighted.name) + 4)
+        safe_addstr(stdscr, preview_row, preview_start, "\u2500" * separator_len,
+                    preview_width, curses.color_pair(1) | curses.A_DIM)
+        preview_row += 1
+
+        # Windows
+        for w in highlighted.windows:
+            if preview_row >= help_row:
+                break
+            emoji = ai_emoji(w)
+            name = _clean_window_name(w.name)
+            line = f"  {emoji}{name}"
+            attr = curses.color_pair(3) | curses.A_BOLD if w.is_current else curses.color_pair(3)
+            safe_addstr(stdscr, preview_row, preview_start, line, preview_width, attr)
+            preview_row += 1
+
+        # ── Help bar ──
+        safe_addstr(
+            stdscr, help_row, 0,
+            " a-z:jump  j/k:nav  enter:switch  q:quit",
+            width, curses.color_pair(4) | curses.A_DIM,
+        )
+
+        stdscr.clearok(True)
+        stdscr.refresh()
+
+        # Input
+        key = stdscr.getch()
+
+        if key == -1:
+            # Timeout — refresh session data for live AI status updates
+            all_sessions = get_sessions()
+            hotkey_map = {}
+            for i, sess in enumerate(all_sessions):
+                if i < len(pool):
+                    hotkey_map[pool[i]] = sess
+            if selected >= len(all_sessions):
+                selected = max(0, len(all_sessions) - 1)
+            continue
+
+        if key in (ord("j"), curses.KEY_DOWN):
+            if selected < len(all_sessions) - 1:
+                selected += 1
+
+        elif key in (ord("k"), curses.KEY_UP):
+            if selected > 0:
+                selected -= 1
+
+        elif key in (ord("\n"), ord("\r")):
+            if all_sessions:
+                switch_to_session(all_sessions[selected].name)
+            return
+
+        elif key in (ord("q"), 27):  # q or Esc
+            return
+
+        elif 0x20 <= key <= 0x7E:
+            ch = chr(key)
+            if ch in hotkey_map:
+                switch_to_session(hotkey_map[ch].name)
+                return
+
+
 def preview_mode(pane_id: str) -> None:
     """Output aligned preview for fzf's --preview command."""
     # Look up window name from pane for AI detection
@@ -803,6 +1019,10 @@ def main() -> None:
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         preview_mode(sys.argv[2])
+        return
+
+    if "--sessions" in sys.argv:
+        curses.wrapper(sessions_ui)
         return
 
     if "--session" in sys.argv:
