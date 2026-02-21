@@ -99,6 +99,7 @@ def fzf_pick(
             "--prompt", prompt,
             "--height", "100%",
             "--layout", "reverse",
+            "--ansi",
         ]
         if header:
             cmd.extend(["--header", header])
@@ -151,7 +152,9 @@ def list_sessions() -> list[dict]:
 
 def format_session_line(session: dict) -> str:
     folder = Path(session["path"]).name
-    return f"{session['name']}  {folder}"
+    dim = "\033[2m"
+    reset = "\033[0m"
+    return f"{session['name']}  {dim}/{folder}{reset}"
 
 
 # ── Steps ────────────────────────────────────────────────────────
