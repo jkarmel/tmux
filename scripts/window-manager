@@ -272,11 +272,8 @@ def _clean_window_name(name: str) -> str:
 
 
 def _abbreviate_path(path: str) -> str:
-    """Abbreviate home dir to ~ for display."""
-    home = os.path.expanduser("~")
-    if path.startswith(home):
-        return "~" + path[len(home):]
-    return path
+    """Return just the last folder name for display."""
+    return os.path.basename(path) or path
 
 
 def switch_to_session(session_name: str) -> None:
@@ -394,6 +391,28 @@ def fzf_search(items: list[TreeItem]) -> Window | None:
         if f"{w.session}:{w.index}" == key:
             return w
     return None
+
+
+# ── View switching ───────────────────────────────────────────────
+
+
+def _read_alt_key(stdscr) -> str | None:
+    """After receiving ESC (27), check if Alt+key follows."""
+    stdscr.timeout(0)
+    ch = stdscr.getch()
+    stdscr.timeout(1000)
+    if ch == -1:
+        return None
+    return chr(ch) if 0x20 <= ch <= 0x7E else None
+
+
+def _handle_alt_switch(stdscr, alt: str, current: str) -> bool:
+    """Switch to another view if alt matches. Returns True if switched."""
+    targets = {"e": ui, "s": sessions_ui, "w": session_ui, "r": robots_ui}
+    if alt in targets and alt != current:
+        targets[alt](stdscr)
+        return True
+    return False
 
 
 # ── Curses rendering helpers ─────────────────────────────────────
@@ -627,8 +646,14 @@ def ui(stdscr) -> None:
             stdscr.refresh()
             last_pane_id = None
 
-        elif key in (ord("q"), 27):  # q or Esc
+        elif key == ord("q"):
             return
+
+        elif key == 27:  # Esc or Alt+key
+            alt = _read_alt_key(stdscr)
+            if alt and _handle_alt_switch(stdscr, alt, "e"):
+                return
+            return  # bare Esc = quit
 
         elif 0x20 <= key <= 0x7E:
             ch = chr(key)
@@ -640,7 +665,7 @@ def ui(stdscr) -> None:
 # ── Session-focused UI ───────────────────────────────────────────
 
 
-def session_ui(stdscr) -> None:
+def session_ui(stdscr, start_session: str | None = None) -> None:
     """Session-focused window browser with h/l to cycle sessions."""
     curses.curs_set(0)
     curses.use_default_colors()
@@ -658,12 +683,15 @@ def session_ui(stdscr) -> None:
     if not session_names:
         return
 
-    # Start on the current session
-    current_target = get_current_target()
-    cur_session = current_target.split(":")[0] if ":" in current_target else ""
+    # Start on the specified or current session
+    if start_session:
+        target_session = start_session
+    else:
+        current_target = get_current_target()
+        target_session = current_target.split(":")[0] if ":" in current_target else ""
     session_idx = 0
     for i, name in enumerate(session_names):
-        if name == cur_session:
+        if name == target_session:
             session_idx = i
             break
 
@@ -815,7 +843,197 @@ def session_ui(stdscr) -> None:
             stdscr.refresh()
             last_pane_id = None
 
-        elif key in (ord("q"), 27):  # q or Esc
+        elif key == ord("q"):
+            return
+
+        elif key == 27:
+            alt = _read_alt_key(stdscr)
+            if alt and _handle_alt_switch(stdscr, alt, "w"):
+                return
+            return
+
+        elif 0x20 <= key <= 0x7E:
+            ch = chr(key)
+            if ch in hotkey_map:
+                switch_to_window(hotkey_map[ch])
+                return
+
+
+# ── AI-only (robots) UI ───────────────────────────────────────
+
+
+def robots_ui(stdscr) -> None:
+    """Like ui() but only shows AI windows across all sessions."""
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)       # session headers
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected
+    curses.init_pair(3, curses.COLOR_WHITE, -1)      # normal window
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)     # help bar
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)    # hotkey letter
+
+    sessions = get_windows()
+    if not sessions:
+        return
+
+    # Filter to AI windows only, drop empty sessions
+    ai_sessions: dict[str, list[Window]] = {}
+    for name, windows in sessions.items():
+        ai_wins = [w for w in windows if is_ai_window(w)]
+        if ai_wins:
+            ai_sessions[name] = ai_wins
+
+    if not ai_sessions:
+        return
+
+    items, hotkey_map = build_tree(ai_sessions)
+    sel_indices = selectable_indices(items)
+    if not sel_indices:
+        return
+
+    # Default to current window (if it's an AI window)
+    selected = 0
+    for i, idx in enumerate(sel_indices):
+        w = items[idx].window
+        if w and w.is_current:
+            selected = i
+            break
+
+    scroll_offset = 0
+    last_pane_id: str | None = None
+    preview_cache: list[str] = []
+
+    stdscr.timeout(1000)
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        list_width = max(width * 35 // 100, 20)
+        preview_start = list_width + 2
+        preview_width = width - preview_start - 1
+        help_row = height - 1
+        tree_height = help_row
+
+        # Keep selection visible
+        sel_tree_idx = sel_indices[selected]
+        if sel_tree_idx < scroll_offset:
+            scroll_offset = sel_tree_idx
+        if sel_tree_idx >= scroll_offset + tree_height:
+            scroll_offset = sel_tree_idx - tree_height + 1
+
+        # Find session header for current selection
+        session_header_idx = None
+        for look_back in range(sel_tree_idx, -1, -1):
+            if items[look_back].kind == "session":
+                session_header_idx = look_back
+                break
+
+        # Sticky header when session header is scrolled off the top
+        sticky_header = None
+        if session_header_idx is not None and session_header_idx < scroll_offset:
+            sticky_header = items[session_header_idx]
+
+        # Capture preview
+        sel_window = items[sel_indices[selected]].window
+        if sel_window:
+            if sel_window.pane_id != last_pane_id:
+                last_pane_id = sel_window.pane_id
+                preview_cache = capture_pane(sel_window.pane_id)
+
+        stdscr.erase()
+
+        # Draw sticky session header if needed
+        tree_start_row = 0
+        if sticky_header:
+            safe_addstr(
+                stdscr, 0, 0, f" {sticky_header.label}",
+                list_width, curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
+            )
+            tree_start_row = 1
+
+        # Draw tree
+        name_col = 2
+        for row in range(tree_start_row, tree_height):
+            tree_idx = scroll_offset + (row - tree_start_row)
+            if tree_idx >= len(items):
+                break
+            item = items[tree_idx]
+            if item.kind == "session":
+                safe_addstr(
+                    stdscr, row, 0, item.label,
+                    list_width, curses.color_pair(1) | curses.A_BOLD,
+                )
+            else:
+                if item.hotkey:
+                    safe_addstr(
+                        stdscr, row, 0, item.hotkey,
+                        1, curses.color_pair(5) | curses.A_BOLD,
+                    )
+                is_sel = tree_idx == sel_indices[selected]
+                attr = curses.color_pair(2) if is_sel else curses.color_pair(3)
+                safe_addstr(stdscr, row, name_col, item.label, list_width - name_col, attr)
+
+        # Draw separator
+        for row in range(tree_height):
+            try:
+                stdscr.addch(row, list_width, curses.ACS_VLINE, curses.color_pair(1))
+            except curses.error:
+                pass
+
+        # Draw help bar
+        safe_addstr(
+            stdscr, help_row, 0,
+            " a-z:jump  j/k:nav  /:search  q:quit",
+            width, curses.color_pair(4) | curses.A_DIM,
+        )
+
+        stdscr.clearok(True)
+        stdscr.refresh()
+
+        # Draw preview
+        render_preview(sel_window, preview_cache,
+                       preview_start, preview_width, tree_height)
+
+        # Input
+        key = stdscr.getch()
+
+        if key == -1:
+            # Timeout — refresh preview and re-scan for AI windows
+            if sel_window:
+                preview_cache = capture_pane(sel_window.pane_id)
+            continue
+
+        if key in (ord("j"), curses.KEY_DOWN):
+            if selected < len(sel_indices) - 1:
+                selected += 1
+                last_pane_id = None
+
+        elif key in (ord("k"), curses.KEY_UP):
+            if selected > 0:
+                selected -= 1
+                last_pane_id = None
+
+        elif key in (ord("\n"), ord("\r")):
+            window = items[sel_indices[selected]].window
+            if window:
+                switch_to_window(window)
+            return
+
+        elif key == ord("/"):
+            curses.endwin()
+            result = fzf_search(items)
+            if result:
+                switch_to_window(result)
+                return
+            stdscr.refresh()
+            last_pane_id = None
+
+        elif key == ord("q"):
+            return
+
+        elif key == 27:
+            alt = _read_alt_key(stdscr)
+            if alt and _handle_alt_switch(stdscr, alt, "r"):
+                return
             return
 
         elif 0x20 <= key <= 0x7E:
@@ -842,11 +1060,12 @@ def sessions_ui(stdscr) -> None:
     if not all_sessions:
         return
 
-    pool = HOTKEY_POOL  # "abcdefghilmnoprstuvwxyz"
-    hotkey_map: dict[str, Session] = {}
+    # Sessions use numbers 1-9, windows use letters
+    win_pool = HOTKEY_POOL  # "abcdefghilmnoprstuvwxyz"
+    session_hotkeys: dict[str, Session] = {}  # "1"-"9" -> Session
     for i, sess in enumerate(all_sessions):
-        if i < len(pool):
-            hotkey_map[pool[i]] = sess
+        if i < 9:
+            session_hotkeys[str(i + 1)] = sess
 
     # Pre-select current session
     selected = 0
@@ -860,7 +1079,7 @@ def sessions_ui(stdscr) -> None:
 
     while True:
         height, width = stdscr.getmaxyx()
-        list_width = max(width * 35 // 100, 20)
+        list_width = max(width * 50 // 100, 20)
         preview_start = list_width + 2
         preview_width = width - preview_start - 1
         help_row = height - 1
@@ -873,6 +1092,13 @@ def sessions_ui(stdscr) -> None:
         if selected >= scroll_offset + list_height:
             scroll_offset = selected - list_height + 1
 
+        # Build window hotkey map for the highlighted session
+        highlighted = all_sessions[selected]
+        win_hotkeys: dict[str, Window] = {}
+        for i, w in enumerate(highlighted.windows):
+            if i < len(win_pool):
+                win_hotkeys[win_pool[i]] = w
+
         stdscr.erase()
 
         # ── Left panel: session list ──
@@ -883,10 +1109,10 @@ def sessions_ui(stdscr) -> None:
             sess = all_sessions[sess_idx]
             is_sel = (sess_idx == selected)
 
-            # Hotkey letter
-            if sess_idx < len(pool):
+            # Hotkey number
+            if sess_idx < 9:
                 safe_addstr(
-                    stdscr, row, 0, pool[sess_idx],
+                    stdscr, row, 0, str(sess_idx + 1),
                     1, curses.color_pair(5) | curses.A_BOLD,
                 )
 
@@ -910,35 +1136,27 @@ def sessions_ui(stdscr) -> None:
                 pass
 
         # ── Right panel: window list for highlighted session ──
-        highlighted = all_sessions[selected]
         preview_row = 0
-
-        # Header
-        safe_addstr(stdscr, preview_row, preview_start, highlighted.name,
-                    preview_width, curses.color_pair(1) | curses.A_BOLD)
-        preview_row += 1
-
-        # Underline
-        separator_len = min(preview_width, len(highlighted.name) + 4)
-        safe_addstr(stdscr, preview_row, preview_start, "\u2500" * separator_len,
-                    preview_width, curses.color_pair(1) | curses.A_DIM)
-        preview_row += 1
-
-        # Windows
-        for w in highlighted.windows:
+        for i, w in enumerate(highlighted.windows):
             if preview_row >= help_row:
                 break
             emoji = ai_emoji(w)
             name = _clean_window_name(w.name)
-            line = f"  {emoji}{name}"
-            attr = curses.color_pair(3) | curses.A_BOLD if w.is_current else curses.color_pair(3)
-            safe_addstr(stdscr, preview_row, preview_start, line, preview_width, attr)
+            label = f"{emoji}{name}"
+            # Hotkey letter
+            hotkey = win_pool[i] if i < len(win_pool) else ""
+            if hotkey:
+                safe_addstr(
+                    stdscr, preview_row, preview_start, hotkey,
+                    1, curses.color_pair(5) | curses.A_BOLD,
+                )
+            safe_addstr(stdscr, preview_row, preview_start + 2, label, preview_width - 2, curses.color_pair(3))
             preview_row += 1
 
         # ── Help bar ──
         safe_addstr(
             stdscr, help_row, 0,
-            " a-z:jump  j/k:nav  enter:switch  q:quit",
+            " 1-9:session  a-z:window  j/k:nav  enter:switch  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -951,10 +1169,10 @@ def sessions_ui(stdscr) -> None:
         if key == -1:
             # Timeout — refresh session data for live AI status updates
             all_sessions = get_sessions()
-            hotkey_map = {}
+            session_hotkeys = {}
             for i, sess in enumerate(all_sessions):
-                if i < len(pool):
-                    hotkey_map[pool[i]] = sess
+                if i < 9:
+                    session_hotkeys[str(i + 1)] = sess
             if selected >= len(all_sessions):
                 selected = max(0, len(all_sessions) - 1)
             continue
@@ -969,16 +1187,27 @@ def sessions_ui(stdscr) -> None:
 
         elif key in (ord("\n"), ord("\r")):
             if all_sessions:
-                switch_to_session(all_sessions[selected].name)
+                session_ui(stdscr, start_session=all_sessions[selected].name)
             return
 
-        elif key in (ord("q"), 27):  # q or Esc
+        elif key == ord("q"):
+            return
+
+        elif key == 27:
+            alt = _read_alt_key(stdscr)
+            if alt and _handle_alt_switch(stdscr, alt, "s"):
+                return
             return
 
         elif 0x20 <= key <= 0x7E:
             ch = chr(key)
-            if ch in hotkey_map:
-                switch_to_session(hotkey_map[ch].name)
+            # Window hotkeys (letters) — switch directly
+            if ch in win_hotkeys:
+                switch_to_window(win_hotkeys[ch])
+                return
+            # Session hotkeys (numbers) — open session-focused view
+            if ch in session_hotkeys:
+                session_ui(stdscr, start_session=session_hotkeys[ch].name)
                 return
 
 
@@ -1019,6 +1248,10 @@ def main() -> None:
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         preview_mode(sys.argv[2])
+        return
+
+    if "--robots" in sys.argv:
+        curses.wrapper(robots_ui)
         return
 
     if "--sessions" in sys.argv:
