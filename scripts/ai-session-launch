@@ -18,6 +18,7 @@ from pathlib import Path
 # ── Constants ────────────────────────────────────────────────────
 
 NEW_SESSION_MARKER = "\u2726 New session"
+THIS_SESSION_PREFIX = "\u25cf This session"
 DEFAULT_PATH_SEGMENTS = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -154,24 +155,35 @@ def format_session_line(session: dict) -> str:
     if path.startswith(home):
         path = "~" + path[len(home):]
 
-    attached = " *" if session["attached"] else ""
-    windows = session["windows"]
-    return f"{session['name']}{attached}  [{windows} win]  {path}"
+    return f"{session['name']}  {path}"
 
 
 # ── Steps ────────────────────────────────────────────────────────
 
 
-def step_pick_session(sessions: list[dict]) -> str | None:
+def get_current_session() -> str:
+    result = run_command(["tmux", "display-message", "-p", "#{session_name}"])
+    return result.stdout.strip()
+
+
+def step_pick_session(sessions: list[dict], current: str) -> str | None:
     """Show fzf session picker. Returns session name or NEW_SESSION_MARKER."""
-    items = [NEW_SESSION_MARKER]
+    this_session_label = f"{THIS_SESSION_PREFIX} ({current})"
+
+    items = [this_session_label, NEW_SESSION_MARKER]
     for s in sessions:
+        if s["name"] == current:
+            continue
         items.append(format_session_line(s))
 
     preview_cmd = (
         "name=$(echo {} | sed \"s/ .*//\");"
         " if echo {} | grep -q '^\\xE2\\x9C\\xA6'; then"
         "   echo 'Create a new tmux session in a folder of your choice';"
+        " elif echo {} | grep -q '^\\xE2\\x97\\x8F'; then"
+        "   tmux list-windows -t " + shlex_quote(current) + ""
+        "     -F '  #{window_index}: #{window_name}  #{pane_current_path}'"
+        "     2>/dev/null || echo 'No windows';"
         " else"
         "   tmux list-windows -t \"$name\""
         "     -F '  #{window_index}: #{window_name}  #{pane_current_path}'"
@@ -190,11 +202,11 @@ def step_pick_session(sessions: list[dict]) -> str | None:
         return None
     if picked == NEW_SESSION_MARKER:
         return NEW_SESSION_MARKER
+    if picked == this_session_label:
+        return current
 
-    # Extract session name (first field, before spaces or " *")
+    # Extract session name (first field, before spaces)
     session_name = picked.split()[0]
-    # Remove trailing * from attached indicator
-    session_name = session_name.rstrip("*").strip()
     return session_name
 
 
@@ -298,8 +310,9 @@ def main() -> int:
             die(f"Missing ai-popup script: {AI_POPUP}")
 
         # Step 1: pick session
+        current = get_current_session()
         sessions = list_sessions()
-        picked = step_pick_session(sessions)
+        picked = step_pick_session(sessions, current)
 
         if picked is None:
             return 0
