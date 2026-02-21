@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Preview helper for ai-session-launch fzf picker.
+# Usage: ai-session-preview <current_session> <selected_line>
+
+current="$1"
+line="$2"
+
+show_ai() {
+  local sname="$1"
+  local found=0
+  tmux list-windows -t "$sname" -F '#{window_name}|#{@ai_status}' 2>/dev/null \
+    | grep -E '\(claude\)|\(codex\)' \
+    | while IFS='|' read -r wname aist; do
+        found=1
+        case "$aist" in
+          active) printf '  ⚡ %s\n' "$wname";;
+          done)   printf '  ✅ %s\n' "$wname";;
+          idle)   printf '  🤖 %s\n' "$wname";;
+          *)      printf '  🤖 %s\n' "$wname";;
+        esac
+      done
+}
+
+# Detect which item is selected
+case "$line" in
+  *New\ session*)
+    echo 'Create a new tmux session in a folder of your choice'
+    ;;
+  *This\ session*)
+    out=$(show_ai "$current")
+    if [ -z "$out" ]; then echo '  No AI windows'; else echo "$out"; fi
+    ;;
+  *)
+    name="${line%% *}"
+    out=$(show_ai "$name")
+    if [ -z "$out" ]; then echo '  No AI windows'; else echo "$out"; fi
+    ;;
+esac

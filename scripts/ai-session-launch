@@ -175,34 +175,8 @@ def step_pick_session(sessions: list[dict], current: str) -> str | None:
             continue
         items.append(format_session_line(s))
 
-    # Preview: show only AI (robot) windows with activity status
-    ai_preview_fn = "\n".join([
-        "show_ai() {",
-        "  local out=$(tmux list-windows -t \"$1\" -F '#{window_name}|#{@ai_status}' 2>/dev/null \\",
-        "    | grep -E '\\(claude\\)|\\(codex\\)' \\",
-        "    | while IFS='|' read -r wname aist; do",
-        "        case \"$aist\" in",
-        "          (active) printf '  ⚡ %s\\n' \"$wname\";;",
-        "          (\"done\") printf '  ✅ %s\\n' \"$wname\";;",
-        "          (idle) printf '  🤖 %s\\n' \"$wname\";;",
-        "          (*) printf '  🤖 %s\\n' \"$wname\";;",
-        "        esac",
-        "      done)",
-        "  if [ -z \"$out\" ]; then echo '  No AI windows'; else echo \"$out\"; fi",
-        "}",
-        "",
-    ])
-    preview_cmd = "\n".join([
-        ai_preview_fn,
-        "if echo {} | grep -q '^\\xE2\\x9C\\xA6'; then",
-        "  echo 'Create a new tmux session in a folder of your choice'",
-        "elif echo {} | grep -q '^\\xE2\\x97\\x8F'; then",
-        f"  show_ai {shlex_quote(current)}",
-        "else",
-        "  name=$(echo {} | sed \"s/ .*//\")",
-        "  show_ai \"$name\"",
-        "fi",
-    ])
+    preview_script = Path.home() / ".tmux" / "scripts" / "ai-session-preview"
+    preview_cmd = f"{shlex_quote(str(preview_script))} {shlex_quote(current)} {{}}"
 
     picked = fzf_pick(
         items,
