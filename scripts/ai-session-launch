@@ -179,9 +179,9 @@ def step_pick_session(sessions: list[dict], current: str) -> str | None:
     ai_preview_fn = (
         "show_ai() {"
         " local out=$(tmux list-windows -t \"$1\""
-        "   -F '#{window_name}\t#{@ai_status}' 2>/dev/null"
+        "   -F '#{window_name}|#{@ai_status}' 2>/dev/null"
         "   | grep -E '\\(claude\\)|\\(codex\\)'"
-        "   | while IFS=$(printf '\\t') read -r wname aist; do"
+        "   | while IFS='|' read -r wname aist; do"
         "     case \"$aist\" in"
         "       active) printf '  ⚡ %s\\n' \"$wname\";;"
         "       done)   printf '  ✅ %s\\n' \"$wname\";;"
