@@ -176,29 +176,31 @@ def step_pick_session(sessions: list[dict], current: str) -> str | None:
         items.append(format_session_line(s))
 
     # Preview: show only AI (robot) windows with activity status
-    ai_preview = (
-        "tmux list-windows -t \"$name\""
-        " -F '#{window_name}\t#{@ai_status}' 2>/dev/null"
-        " | grep -E '\\(claude\\)|\\(codex\\)'"
-        " | while IFS=$'\\t' read -r wname aist; do"
-        "   case \"$aist\" in"
-        "     active) echo \"  ⚡ $wname\";;"
-        "     done)   echo \"  ✅ $wname\";;"
-        "     idle)   echo \"  🤖 $wname\";;"
-        "     *)      echo \"  🤖 $wname\";;"
-        "   esac;"
-        " done"
+    ai_preview_fn = (
+        "show_ai() {"
+        " local out=$(tmux list-windows -t \"$1\""
+        "   -F '#{window_name}\t#{@ai_status}' 2>/dev/null"
+        "   | grep -E '\\(claude\\)|\\(codex\\)'"
+        "   | while IFS=$(printf '\\t') read -r wname aist; do"
+        "     case \"$aist\" in"
+        "       active) printf '  ⚡ %s\\n' \"$wname\";;"
+        "       done)   printf '  ✅ %s\\n' \"$wname\";;"
+        "       idle)   printf '  🤖 %s\\n' \"$wname\";;"
+        "       *)      printf '  🤖 %s\\n' \"$wname\";;"
+        "     esac;"
+        "   done);"
+        " if [ -z \"$out\" ]; then echo '  No AI windows'; else echo \"$out\"; fi;"
+        "}; "
     )
     preview_cmd = (
-        "name=$(echo {} | sed \"s/ .*//\");"
-        " if echo {} | grep -q '^\\xE2\\x9C\\xA6'; then"
-        "   echo 'Create a new tmux session in a folder of your choice';"
+        f"{ai_preview_fn}"
+        "if echo {} | grep -q '^\\xE2\\x9C\\xA6'; then"
+        "  echo 'Create a new tmux session in a folder of your choice';"
         " elif echo {} | grep -q '^\\xE2\\x97\\x8F'; then"
-        f"   name={shlex_quote(current)}; {ai_preview}"
-        "   | if ! read -r line; then echo '  No AI windows'; else echo \"$line\"; cat; fi;"
+        f"  show_ai {shlex_quote(current)};"
         " else"
-        f"   {ai_preview}"
-        "   | if ! read -r line; then echo '  No AI windows'; else echo \"$line\"; cat; fi;"
+        "  name=$(echo {} | sed \"s/ .*//\");"
+        "  show_ai \"$name\";"
         " fi"
     )
 
