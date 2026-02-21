@@ -150,12 +150,8 @@ def list_sessions() -> list[dict]:
 
 
 def format_session_line(session: dict) -> str:
-    path = session["path"]
-    home = str(Path.home())
-    if path.startswith(home):
-        path = "~" + path[len(home):]
-
-    return f"{session['name']}  {path}"
+    folder = Path(session["path"]).name
+    return f"{session['name']}  {folder}"
 
 
 # ── Steps ────────────────────────────────────────────────────────
