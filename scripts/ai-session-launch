@@ -18,6 +18,7 @@ from pathlib import Path
 # ── Constants ────────────────────────────────────────────────────
 
 NEW_SESSION_MARKER = "\u2726 New session"
+NEW_FOLDER_MARKER = "\u2726 New folder"
 THIS_SESSION_PREFIX = "\u25cf This session"
 DEFAULT_PATH_SEGMENTS = [
     "/opt/homebrew/bin",
@@ -197,6 +198,21 @@ def step_pick_session(sessions: list[dict], current: str) -> str | None:
     return session_name
 
 
+def _prompt_new_folder() -> str | None:
+    """Prompt user for a new folder path and create it."""
+    try:
+        path_str = input("Enter path for new folder (relative to ~): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not path_str:
+        return None
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = Path.home() / path
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def step_pick_folder() -> str | None:
     """Show fzf folder picker for new session."""
     home = str(Path.home())
@@ -230,7 +246,7 @@ def step_pick_folder() -> str | None:
             output_path = Path(outfile.name)
 
         fzf_cmd = (
-            f"{find_cmd} | fzf "
+            f"(printf '%s\\n' {shlex_quote(NEW_FOLDER_MARKER)}; {find_cmd}) | fzf "
             f"--prompt 'folder> ' "
             f"--header 'Pick a folder for the new session' "
             f"--height 100% --layout reverse "
@@ -249,6 +265,8 @@ def step_pick_folder() -> str | None:
             return None
 
         picked = output_path.read_text(encoding="utf-8").strip()
+        if picked == NEW_FOLDER_MARKER:
+            return _prompt_new_folder()
         return picked or None
     finally:
         if output_path is not None:

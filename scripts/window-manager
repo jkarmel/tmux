@@ -19,8 +19,11 @@ import curses
 import locale
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -1043,6 +1046,110 @@ def robots_ui(stdscr) -> None:
                 return
 
 
+# ── New session creation ──────────────────────────────────────
+
+
+FOLDER_MAX_DEPTH = 3
+NEW_FOLDER_MARKER = "\u2726 New folder"
+
+
+def _prompt_new_folder() -> str | None:
+    """Prompt user for a new folder path and create it."""
+    try:
+        path_str = input("Enter path for new folder (relative to ~): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not path_str:
+        return None
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = Path.home() / path
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _pick_folder() -> str | None:
+    """Show fzf folder picker for new session creation."""
+    home = str(Path.home())
+
+    if shutil.which("fd"):
+        find_cmd = (
+            f"fd --type d --max-depth {FOLDER_MAX_DEPTH} "
+            f"--exclude .git --exclude node_modules --exclude .cache "
+            f"--exclude Library --exclude .Trash --exclude .worktrees "
+            f"--exclude __pycache__ --exclude .venv --exclude venv "
+            f"--exclude .npm --exclude .cargo --exclude .rustup "
+            f". {shlex.quote(home)}"
+        )
+    else:
+        find_cmd = (
+            f"find {shlex.quote(home)} -maxdepth {FOLDER_MAX_DEPTH} "
+            f"\\( -name .git -o -name node_modules -o -name .cache "
+            f"-o -name Library -o -name .Trash -o -name .worktrees "
+            f"-o -name __pycache__ -o -name .venv -o -name venv "
+            f"-o -name .npm -o -name .cargo -o -name .rustup "
+            f"\\) -prune -o -type d -print"
+        )
+
+    fzf_cmd = (
+        f"(printf '%s\\n' {shlex.quote(NEW_FOLDER_MARKER)}; {find_cmd}) | fzf "
+        f"--prompt 'folder> ' "
+        f"--header 'Pick a folder for the new session' "
+        f"--height 100% --layout reverse "
+        f"--preview-window right:50%:wrap "
+        f"--preview 'ls -la {{}} 2>/dev/null'"
+    )
+
+    output_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="wm-folder-out.", delete=False
+        ) as outfile:
+            output_path = Path(outfile.name)
+
+        with output_path.open("w", encoding="utf-8") as stdout_fh:
+            result = subprocess.run(
+                ["bash", "-c", fzf_cmd],
+                stdout=stdout_fh,
+                check=False,
+            )
+
+        if result.returncode != 0:
+            return None
+
+        picked = output_path.read_text(encoding="utf-8").strip()
+        if picked == NEW_FOLDER_MARKER:
+            return _prompt_new_folder()
+        return picked or None
+    finally:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+
+
+def _create_session(folder: str) -> str | None:
+    """Create a new tmux session in the given folder and return its name."""
+    path = Path(folder)
+    session_name = path.name
+
+    # Avoid name collision
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True, text=True, check=False,
+    )
+    existing = set(result.stdout.strip().splitlines()) if result.returncode == 0 else set()
+    base_name = session_name
+    counter = 1
+    while session_name in existing:
+        session_name = f"{base_name}-{counter}"
+        counter += 1
+
+    result = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session_name, "-c", str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    return session_name if result.returncode == 0 else None
+
+
 # ── Session list UI ───────────────────────────────────────────
 
 
@@ -1156,7 +1263,7 @@ def sessions_ui(stdscr) -> None:
         # ── Help bar ──
         safe_addstr(
             stdscr, help_row, 0,
-            " 1-9:session  a-z:window  j/k:nav  enter:switch  q:quit",
+            " 1-9:session  a-z:window  j/k:nav  n:new  enter:switch  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1189,6 +1296,36 @@ def sessions_ui(stdscr) -> None:
             if all_sessions:
                 session_ui(stdscr, start_session=all_sessions[selected].name)
             return
+
+        elif key == ord("n"):
+            curses.endwin()
+            folder = _pick_folder()
+            if folder:
+                session_name = _create_session(folder)
+                if session_name:
+                    switch_to_session(session_name)
+                    return
+            # Cancelled — restore curses
+            stdscr = curses.initscr()
+            curses.noecho()
+            curses.cbreak()
+            stdscr.keypad(True)
+            curses.curs_set(0)
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
+            curses.init_pair(3, curses.COLOR_WHITE, -1)
+            curses.init_pair(4, curses.COLOR_YELLOW, -1)
+            curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+            stdscr.timeout(1000)
+            # Refresh session list
+            all_sessions = get_sessions()
+            session_hotkeys = {}
+            for i, sess in enumerate(all_sessions):
+                if i < 9:
+                    session_hotkeys[str(i + 1)] = sess
+            if selected >= len(all_sessions):
+                selected = max(0, len(all_sessions) - 1)
 
         elif key == ord("q"):
             return
