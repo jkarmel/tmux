@@ -787,7 +787,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
         # Help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " a-z:jump  h/l:session  j/k:nav  /:search  q:quit",
+            " a-z:jump  h/l:session  j/k:nav  n:new  /:search  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -836,6 +836,22 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
                 if window:
                     switch_to_window(window)
             return
+
+        elif key == ord("n"):
+            # Create a new window in the current session
+            sess_name = session_names[session_idx]
+            subprocess.run(
+                ["tmux", "new-window", "-t", sess_name],
+                capture_output=True, check=False,
+            )
+            # Refresh window list
+            sessions = get_windows()
+            session_names = list(sessions.keys())
+            if sess_name in session_names:
+                session_idx = session_names.index(sess_name)
+            scroll_offset = 0
+            last_pane_id = None
+            rebuild()
 
         elif key == ord("/"):
             curses.endwin()
