@@ -1055,7 +1055,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
             start_dir = sp.stdout.strip()
             cmd = ["tmux", "new-window", "-d", "-t", f"={sess_name}:"]
             if start_dir:
-                cmd += ["-c", start_dir]
+                cmd += ["-c", start_dir, "-n", os.path.basename(start_dir)]
             subprocess.run(cmd, capture_output=True, check=False)
             # Refresh window list
             sessions = get_windows()
