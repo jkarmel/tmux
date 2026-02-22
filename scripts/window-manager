@@ -460,8 +460,8 @@ def build_session_tree(
     windows: list[Window],
 ) -> tuple[list[TreeItem], dict[str, Window]]:
     """Build tree for a single session (windows only, no session headers)."""
-    # Skip h/l (session nav) in addition to j/k (nav) and q (quit)
-    pool = "abcdefgimnoprstuvwxyz"
+    # Skip h/l (session nav), n (new window) in addition to j/k (nav) and q (quit)
+    pool = "abcdefgimoprstuvwxyz"
     items: list[TreeItem] = []
     hotkey_map: dict[str, Window] = {}
     hotkey_idx = 0
@@ -1047,7 +1047,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
             # Create a new window in the current session
             sess_name = session_names[session_idx]
             subprocess.run(
-                ["tmux", "new-window", "-t", sess_name],
+                ["tmux", "new-window", "-d", "-t", sess_name],
                 capture_output=True, check=False,
             )
             # Refresh window list
