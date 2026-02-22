@@ -854,6 +854,82 @@ def ui(stdscr) -> None:
 # ── Session-focused UI ───────────────────────────────────────────
 
 
+def _prompt_window_name(stdscr) -> str | None:
+    """Show a centered dialog prompting for a new window name.
+
+    Returns the entered name on Enter, or None on Escape.
+    """
+    max_h, max_w = stdscr.getmaxyx()
+    width = min(40, max_w - 2)
+    height = 5
+    y = (max_h - height) // 2
+    x = (max_w - width) // 2
+
+    win = curses.newwin(height, width, y, x)
+    win.keypad(True)
+    win.box()
+
+    label = "Window name: "
+    field_y = 2
+    field_x = 2 + len(label)
+    field_width = width - field_x - 2
+
+    buf = list("zsh")
+    cursor = len(buf)
+    selected_all = True  # initial state: text is "selected"
+
+    while True:
+        # Draw label
+        win.addstr(field_y, 2, label)
+        # Draw field contents
+        text = "".join(buf)
+        display = text[:field_width].ljust(field_width)
+        if selected_all:
+            win.addstr(field_y, field_x, display, curses.A_REVERSE)
+        else:
+            win.addstr(field_y, field_x, display)
+        # Position cursor
+        cx = field_x + min(cursor, field_width - 1)
+        win.move(field_y, cx)
+        win.refresh()
+
+        ch = win.getch()
+
+        if ch == 27:  # Escape
+            del win
+            stdscr.clearok(True)
+            return None
+        elif ch in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            del win
+            stdscr.clearok(True)
+            name = "".join(buf).strip()
+            return name if name else None
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if selected_all:
+                buf.clear()
+                cursor = 0
+                selected_all = False
+            elif cursor > 0:
+                buf.pop(cursor - 1)
+                cursor -= 1
+        elif ch == curses.KEY_LEFT:
+            selected_all = False
+            if cursor > 0:
+                cursor -= 1
+        elif ch == curses.KEY_RIGHT:
+            selected_all = False
+            if cursor < len(buf):
+                cursor += 1
+        elif 32 <= ch <= 126:
+            if selected_all:
+                buf.clear()
+                cursor = 0
+                selected_all = False
+            if len(buf) < field_width:
+                buf.insert(cursor, chr(ch))
+                cursor += 1
+
+
 def session_ui(stdscr, start_session: str | None = None) -> None:
     """Session-focused window browser with h/l to cycle sessions."""
     curses.curs_set(0)
@@ -1045,6 +1121,10 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
 
         elif key == ord("n"):
             # Create a new window in the current session
+            win_name = _prompt_window_name(stdscr)
+            if win_name is None:
+                rebuild()
+                continue
             sess_name = session_names[session_idx]
             # Get the session's start directory so the new window opens there
             sp = subprocess.run(
@@ -1053,7 +1133,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
                 capture_output=True, text=True, check=False,
             )
             start_dir = sp.stdout.strip()
-            cmd = ["tmux", "new-window", "-d", "-t", f"={sess_name}:", "-n", "unt"]
+            cmd = ["tmux", "new-window", "-d", "-t", f"={sess_name}:", "-n", win_name]
             if start_dir:
                 cmd += ["-c", start_dir]
             subprocess.run(cmd, capture_output=True, check=False)
