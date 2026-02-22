@@ -331,14 +331,21 @@ def main() -> int:
             session_name = create_new_session(folder)
             if session_name is None:
                 return 0
+            # Pass folder to ai-popup so it uses the right directory
+            # (the popup's #{pane_current_path} still points to the old session)
+            new_session_dir = folder
         else:
             session_name = picked
+            new_session_dir = None
 
         # Switch client to the chosen session
         run_command(["tmux", "switch-client", "-t", session_name])
 
         # Launch ai-popup (exec replaces this process)
-        os.execvp("python3", ["python3", str(AI_POPUP)])
+        cmd = ["python3", str(AI_POPUP)]
+        if new_session_dir:
+            cmd.extend(["--cwd", new_session_dir])
+        os.execvp("python3", cmd)
 
     except RuntimeError as exc:
         die(str(exc))

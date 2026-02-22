@@ -7,6 +7,7 @@ then calls ai-launch with the appropriate flags.
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -73,7 +74,11 @@ def run_command(
 # ── Directory and File Discovery ─────────────────────────────────
 
 
-def get_pane_dir() -> Path:
+def get_pane_dir(override: str | None = None) -> Path:
+    if override:
+        path = Path(override)
+        if path.is_dir():
+            return path
     result = run_command(
         ["tmux", "display-message", "-p", "#{pane_current_path}"]
     )
@@ -86,9 +91,7 @@ def get_pane_dir() -> Path:
     return Path.cwd()
 
 
-def get_repo_root() -> Path | None:
-    start_dir = get_pane_dir()
-
+def get_repo_root(start_dir: Path) -> Path | None:
     git_result = run_command(
         ["git", "-C", str(start_dir), "rev-parse", "--show-toplevel"]
     )
@@ -111,14 +114,13 @@ def confirm(prompt: str) -> bool:
     return answer in ("y", "yes")
 
 
-def ensure_git_ready() -> Path | None:
+def ensure_git_ready(pane_dir: Path) -> Path | None:
     """Ensure pane directory is in a git repo with at least one commit.
 
     Offers to create the repo and/or initial commit if missing.
     Returns the repo root, or None if the user declines.
     """
-    pane_dir = get_pane_dir()
-    repo_root = get_repo_root()
+    repo_root = get_repo_root(pane_dir)
 
     if repo_root is None:
         print(f"No git repository found in {pane_dir}")
@@ -263,6 +265,10 @@ def step_pick_name() -> str:
 
 def main() -> int:
     try:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--cwd", default=None, help="Override working directory")
+        args = parser.parse_args()
+
         ensure_reasonable_path()
         require_dependency("tmux")
         require_dependency("fzf")
@@ -270,7 +276,8 @@ def main() -> int:
         if not AI_LAUNCH.is_file():
             die(f"Missing ai-launch script: {AI_LAUNCH}")
 
-        repo_root = ensure_git_ready()
+        pane_dir = get_pane_dir(args.cwd)
+        repo_root = ensure_git_ready(pane_dir)
         if repo_root is None:
             return 0
 
@@ -309,7 +316,7 @@ def main() -> int:
                 die(f"Selected file does not exist: {todo_path}")
             cmd = [str(AI_LAUNCH), "--agent", agent, "--todo", str(todo_path)]
 
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False, cwd=pane_dir)
         if result.returncode != 0:
             pause_for_popup()
         return result.returncode
