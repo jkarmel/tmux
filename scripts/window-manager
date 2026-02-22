@@ -415,6 +415,11 @@ def _handle_alt_switch(stdscr, alt: str, current: str) -> bool:
     if alt in targets and alt != current:
         targets[alt](stdscr)
         return True
+    # Alt+a → exec into ai-session-launch (reuses the same popup)
+    if alt == "a":
+        curses.endwin()
+        script = str(Path.home() / ".tmux" / "scripts" / "ai-session-launch")
+        os.execvp("python3", ["python3", script])
     return False
 
 
