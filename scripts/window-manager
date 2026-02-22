@@ -1279,7 +1279,7 @@ def sessions_ui(stdscr) -> None:
         # ── Help bar ──
         safe_addstr(
             stdscr, help_row, 0,
-            " 1-9:session  a-z:window  j/k:nav  n:new  enter:switch  q:quit",
+            " 1-9:session  a-z:window  j/k:nav  n:new  del:kill  enter:switch  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1312,6 +1312,39 @@ def sessions_ui(stdscr) -> None:
             if all_sessions:
                 session_ui(stdscr, start_session=all_sessions[selected].name)
             return
+
+        elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
+            if all_sessions:
+                target = all_sessions[selected]
+                # Show confirmation on the help bar
+                prompt = f" Kill session '{target.name}'? y/n"
+                safe_addstr(stdscr, help_row, 0, prompt, width,
+                            curses.color_pair(4) | curses.A_BOLD)
+                stdscr.clrtoeol()
+                stdscr.refresh()
+                stdscr.timeout(-1)  # block until keypress
+                confirm_key = stdscr.getch()
+                stdscr.timeout(1000)
+                if confirm_key in (ord("y"), ord("Y")):
+                    # If killing the current session, switch away first
+                    if target.is_current and len(all_sessions) > 1:
+                        # Pick the next session, or previous if at the end
+                        alt_idx = selected + 1 if selected + 1 < len(all_sessions) else selected - 1
+                        switch_to_session(all_sessions[alt_idx].name)
+                    subprocess.run(
+                        ["tmux", "kill-session", "-t", target.name],
+                        capture_output=True, check=False,
+                    )
+                    # Refresh session list
+                    all_sessions = get_sessions()
+                    if not all_sessions:
+                        return
+                    session_hotkeys = {}
+                    for i, sess in enumerate(all_sessions):
+                        if i < 9:
+                            session_hotkeys[str(i + 1)] = sess
+                    if selected >= len(all_sessions):
+                        selected = max(0, len(all_sessions) - 1)
 
         elif key == ord("n"):
             curses.endwin()
