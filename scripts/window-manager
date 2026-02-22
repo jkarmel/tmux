@@ -1046,10 +1046,17 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
         elif key == ord("n"):
             # Create a new window in the current session
             sess_name = session_names[session_idx]
-            subprocess.run(
-                ["tmux", "new-window", "-d", "-t", f"={sess_name}:"],
-                capture_output=True, check=False,
+            # Get the session's start directory so the new window opens there
+            sp = subprocess.run(
+                ["tmux", "display-message", "-t", f"={sess_name}:",
+                 "-p", "#{session_path}"],
+                capture_output=True, text=True, check=False,
             )
+            start_dir = sp.stdout.strip()
+            cmd = ["tmux", "new-window", "-d", "-t", f"={sess_name}:"]
+            if start_dir:
+                cmd += ["-c", start_dir]
+            subprocess.run(cmd, capture_output=True, check=False)
             # Refresh window list
             sessions = get_windows()
             session_names = list(sessions.keys())
