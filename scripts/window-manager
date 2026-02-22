@@ -1137,7 +1137,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
             if start_dir:
                 cmd += ["-c", start_dir]
             subprocess.run(cmd, capture_output=True, check=False)
-            # Refresh window list
+            # Refresh window list and select the new window
             sessions = get_windows()
             session_names = list(sessions.keys())
             if sess_name in session_names:
@@ -1145,6 +1145,12 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
             scroll_offset = 0
             last_pane_id = None
             rebuild()
+            # Move cursor to the newly created window (last with matching name)
+            for i in range(len(sel_indices) - 1, -1, -1):
+                w = items[sel_indices[i]].window
+                if w and w.name == win_name:
+                    selected = i
+                    break
 
         elif key == ord("/"):
             curses.endwin()
