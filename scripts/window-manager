@@ -485,6 +485,30 @@ def render_preview(window: Window | None, content: list[str],
     sys.stdout.flush()
 
 
+# ── Kill window helper ────────────────────────────────────────────
+
+
+def _confirm_kill_window(stdscr, window: Window, help_row: int, width: int) -> bool:
+    """Show y/n confirmation and kill a tmux window. Returns True if killed."""
+    name = _clean_window_name(window.name)
+    prompt = f" Kill window '{name}' ({window.session}:{window.index})? y/n"
+    safe_addstr(stdscr, help_row, 0, prompt, width,
+                curses.color_pair(4) | curses.A_BOLD)
+    stdscr.clrtoeol()
+    stdscr.refresh()
+    stdscr.timeout(-1)
+    confirm_key = stdscr.getch()
+    stdscr.timeout(1000)
+    if confirm_key not in (ord("y"), ord("Y")):
+        return False
+    target = f"{window.session}:{window.index}"
+    subprocess.run(
+        ["tmux", "kill-window", "-t", target],
+        capture_output=True, check=False,
+    )
+    return True
+
+
 # ── Main UI ──────────────────────────────────────────────────────
 
 
@@ -600,7 +624,7 @@ def ui(stdscr) -> None:
         # Draw help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " a-z:jump  j/k:nav  /:search  q:quit",
+            " a-z:jump  j/k:nav  del:kill  /:search  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -632,6 +656,23 @@ def ui(stdscr) -> None:
             if selected > 0:
                 selected -= 1
                 last_pane_id = None
+
+        elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
+            if sel_indices:
+                window = items[sel_indices[selected]].window
+                if window and _confirm_kill_window(stdscr, window, help_row, width):
+                    sessions = get_windows()
+                    if not sessions:
+                        return
+                    items, hotkey_map = build_tree(sessions)
+                    sel_indices = selectable_indices(items)
+                    if not sel_indices:
+                        return
+                    if selected >= len(sel_indices):
+                        selected = max(0, len(sel_indices) - 1)
+                    scroll_offset = 0
+                    last_pane_id = None
+                    preview_cache = []
 
         elif key in (ord("\n"), ord("\r")):
             window = items[sel_indices[selected]].window
@@ -787,7 +828,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
         # Help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " a-z:jump  h/l:session  j/k:nav  n:new  /:search  q:quit",
+            " a-z:jump  h/l:session  j/k:nav  n:new  del:kill  /:search  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -815,6 +856,26 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
             if selected > 0:
                 selected -= 1
                 last_pane_id = None
+
+        elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
+            if sel_indices:
+                window = items[sel_indices[selected]].window
+                if window and _confirm_kill_window(stdscr, window, help_row, width):
+                    # Refresh window list
+                    sessions = get_windows()
+                    session_names = list(sessions.keys())
+                    if not session_names:
+                        return
+                    # Stay on same session if it still exists
+                    sess_name = window.session
+                    if sess_name in session_names:
+                        session_idx = session_names.index(sess_name)
+                    elif session_idx >= len(session_names):
+                        session_idx = len(session_names) - 1
+                    scroll_offset = 0
+                    last_pane_id = None
+                    preview_cache = []
+                    rebuild()
 
         elif key in (ord("l"), curses.KEY_RIGHT):
             # Next session
@@ -1001,7 +1062,7 @@ def robots_ui(stdscr) -> None:
         # Draw help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " a-z:jump  j/k:nav  /:search  q:quit",
+            " a-z:jump  j/k:nav  del:kill  /:search  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1030,6 +1091,29 @@ def robots_ui(stdscr) -> None:
             if selected > 0:
                 selected -= 1
                 last_pane_id = None
+
+        elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
+            if sel_indices:
+                window = items[sel_indices[selected]].window
+                if window and _confirm_kill_window(stdscr, window, help_row, width):
+                    # Re-scan AI windows
+                    sessions = get_windows()
+                    ai_sessions = {}
+                    for sname, wins in sessions.items():
+                        ai_wins = [w for w in wins if is_ai_window(w)]
+                        if ai_wins:
+                            ai_sessions[sname] = ai_wins
+                    if not ai_sessions:
+                        return
+                    items, hotkey_map = build_tree(ai_sessions)
+                    sel_indices = selectable_indices(items)
+                    if not sel_indices:
+                        return
+                    if selected >= len(sel_indices):
+                        selected = max(0, len(sel_indices) - 1)
+                    scroll_offset = 0
+                    last_pane_id = None
+                    preview_cache = []
 
         elif key in (ord("\n"), ord("\r")):
             window = items[sel_indices[selected]].window
