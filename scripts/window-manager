@@ -1047,7 +1047,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
             # Create a new window in the current session
             sess_name = session_names[session_idx]
             subprocess.run(
-                ["tmux", "new-window", "-d", "-t", sess_name],
+                ["tmux", "new-window", "-d", "-t", f"={sess_name}:"],
                 capture_output=True, check=False,
             )
             # Refresh window list
