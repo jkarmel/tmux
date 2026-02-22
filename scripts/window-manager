@@ -150,6 +150,7 @@ class Worktree:
     head: str             # HEAD SHA
     display_name: str     # "easy-claw" (no ai/ prefix, no timestamp)
     last_commit_date: str # "3 hours ago" via git log --format=%cr
+    commit_ts: int        # unix timestamp for sorting
     status: str           # "clean" | "dirty" | "prunable"
     merged: bool          # all commits reachable from main?
 
@@ -235,33 +236,37 @@ def get_sessions() -> list[Session]:
     return sessions
 
 
-def get_worktrees() -> list[Worktree]:
-    """Discover all git worktrees across tmux session paths."""
-    # 1. Discover repo roots from tmux sessions
-    result = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_path}"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return []
-
-    session_paths = set(result.stdout.strip().splitlines())
-    repo_roots: set[str] = set()
-    for sp in session_paths:
-        if not sp:
-            continue
-        r = subprocess.run(
-            ["git", "-C", sp, "rev-parse", "--show-toplevel"],
+def get_worktrees(repo_root: Path | None = None) -> list[Worktree]:
+    """Discover git worktrees. If repo_root is given, query only that repo."""
+    if repo_root is not None:
+        roots = [repo_root]
+    else:
+        # Discover repo roots from tmux sessions
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_path}"],
             capture_output=True, text=True,
         )
-        if r.returncode == 0 and r.stdout.strip():
-            repo_roots.add(r.stdout.strip())
+        if result.returncode != 0:
+            return []
+
+        session_paths = set(result.stdout.strip().splitlines())
+        repo_roots_set: set[str] = set()
+        for sp in session_paths:
+            if not sp:
+                continue
+            r = subprocess.run(
+                ["git", "-C", sp, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                repo_roots_set.add(r.stdout.strip())
+        roots = [Path(p) for p in sorted(repo_roots_set)]
 
     worktrees: list[Worktree] = []
 
-    for root_str in sorted(repo_roots):
-        root = Path(root_str)
-        # 2. Parse git worktree list --porcelain
+    for root in roots:
+        root_str = str(root)
+        # Parse git worktree list --porcelain
         r = subprocess.run(
             ["git", "-C", root_str, "worktree", "list", "--porcelain"],
             capture_output=True, text=True,
@@ -312,15 +317,22 @@ def get_worktrees() -> list[Worktree]:
             if not display:
                 display = wt_path.name
 
-            # Last commit date
+            # Last commit date + unix timestamp for sorting
+            commit_ts = 0
+            last_commit = "unknown"
             if head:
                 r2 = subprocess.run(
-                    ["git", "-C", root_str, "log", "-1", "--format=%cr", head],
+                    ["git", "-C", root_str, "log", "-1", "--format=%ct\t%cr", head],
                     capture_output=True, text=True,
                 )
-                last_commit = r2.stdout.strip() if r2.returncode == 0 else "unknown"
-            else:
-                last_commit = "unknown"
+                if r2.returncode == 0 and r2.stdout.strip():
+                    parts = r2.stdout.strip().split("\t", 1)
+                    try:
+                        commit_ts = int(parts[0])
+                    except ValueError:
+                        pass
+                    if len(parts) > 1:
+                        last_commit = parts[1]
 
             # Merged check
             if head:
@@ -352,10 +364,13 @@ def get_worktrees() -> list[Worktree]:
                 head=head,
                 display_name=display,
                 last_commit_date=last_commit,
+                commit_ts=commit_ts,
                 status=status,
                 merged=merged,
             ))
 
+    # Sort oldest first (ascending by commit timestamp)
+    worktrees.sort(key=lambda wt: wt.commit_ts)
     return worktrees
 
 
@@ -1049,7 +1064,7 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
         # Help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " a-z:jump  h/l:session  j/k:nav  n:new  del:kill  /:search  q:quit",
+            " a-z:jump  h/l:session  j/k:nav  n:new  del:kill  t:worktrees  /:search  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1151,6 +1166,25 @@ def session_ui(stdscr, start_session: str | None = None) -> None:
                 if w and w.name == win_name:
                     selected = i
                     break
+
+        elif key == ord("t"):
+            # Open worktrees scoped to the current session's repo
+            sess_name = session_names[session_idx]
+            r = subprocess.run(
+                ["tmux", "display-message", "-t", sess_name, "-p", "#{session_path}"],
+                capture_output=True, text=True,
+            )
+            sess_path = r.stdout.strip() if r.returncode == 0 else ""
+            if sess_path:
+                r2 = subprocess.run(
+                    ["git", "-C", sess_path, "rev-parse", "--show-toplevel"],
+                    capture_output=True, text=True,
+                )
+                if r2.returncode == 0 and r2.stdout.strip():
+                    worktrees_ui(stdscr, repo_root=Path(r2.stdout.strip()))
+                    # Return to session_ui loop after worktrees_ui exits
+                    last_pane_id = None
+                    continue
 
         elif key == ord("/"):
             curses.endwin()
@@ -1446,8 +1480,8 @@ def _confirm_delete_worktree(stdscr, wt: Worktree, help_row: int, width: int) ->
 # ── Worktrees UI ─────────────────────────────────────────────
 
 
-def worktrees_ui(stdscr) -> None:
-    """Worktree cleanup browser showing all git worktrees."""
+def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
+    """Worktree browser. If repo_root given, scoped to that repo only."""
     curses.curs_set(0)
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_CYAN, -1)       # headers
@@ -1457,7 +1491,7 @@ def worktrees_ui(stdscr) -> None:
     curses.init_pair(5, curses.COLOR_MAGENTA, -1)    # hotkey letter
     curses.init_pair(6, curses.COLOR_RED, -1)        # prunable
 
-    all_wt = get_worktrees()
+    all_wt = get_worktrees(repo_root=repo_root)
     if not all_wt:
         # Show empty state
         height, width = stdscr.getmaxyx()
@@ -1575,7 +1609,7 @@ def worktrees_ui(stdscr) -> None:
         elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
             if all_wt:
                 if _confirm_delete_worktree(stdscr, all_wt[selected], help_row, width):
-                    all_wt = get_worktrees()
+                    all_wt = get_worktrees(repo_root=repo_root)
                     if not all_wt:
                         return
                     if selected >= len(all_wt):
@@ -1824,7 +1858,7 @@ def sessions_ui(stdscr) -> None:
         # ── Help bar ──
         safe_addstr(
             stdscr, help_row, 0,
-            " 1-9:session  a-z:window  j/k:nav  n:new  del:kill  t:worktrees  enter:switch  q:quit",
+            " 1-9:session  a-z:window  j/k:nav  n:new  del:kill  enter:switch  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1921,10 +1955,6 @@ def sessions_ui(stdscr) -> None:
             if selected >= len(all_sessions):
                 selected = max(0, len(all_sessions) - 1)
 
-        elif key == ord("t"):
-            worktrees_ui(stdscr)
-            return
-
         elif key == ord("q"):
             return
 
@@ -1983,10 +2013,6 @@ def main() -> None:
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         preview_mode(sys.argv[2])
-        return
-
-    if "--worktrees" in sys.argv:
-        curses.wrapper(worktrees_ui)
         return
 
     if "--robots" in sys.argv:
