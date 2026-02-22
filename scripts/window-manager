@@ -27,6 +27,7 @@ import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -167,6 +168,20 @@ def get_current_target() -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+SESSION_ORDER_FILE = Path.home() / ".tmux" / "session-order"
+
+
+def _session_sort_key() -> Callable[[str], tuple[int, str]]:
+    """Return a sort-key function based on ~/.tmux/session-order."""
+    try:
+        text = SESSION_ORDER_FILE.read_text(encoding="utf-8")
+        order = [line.strip() for line in text.splitlines() if line.strip()]
+    except FileNotFoundError:
+        order = []
+    order_map = {name: i for i, name in enumerate(order)}
+    return lambda name: (order_map.get(name, len(order)), name)
+
+
 def get_windows() -> dict[str, list[Window]]:
     """Return windows grouped by session name (insertion-ordered)."""
     current = get_current_target()
@@ -180,7 +195,7 @@ def get_windows() -> dict[str, list[Window]]:
     if result.returncode != 0:
         return {}
 
-    sessions: dict[str, list[Window]] = {}
+    raw: dict[str, list[Window]] = {}
     for line in result.stdout.strip().split("\n"):
         if not line:
             continue
@@ -198,8 +213,10 @@ def get_windows() -> dict[str, list[Window]]:
             ai_status=ai_status,
             is_current=(target == current),
         )
-        sessions.setdefault(session, []).append(w)
-    return sessions
+        raw.setdefault(session, []).append(w)
+
+    key_fn = _session_sort_key()
+    return {name: raw[name] for name in sorted(raw, key=key_fn)}
 
 
 def get_sessions() -> list[Session]:
@@ -234,6 +251,9 @@ def get_sessions() -> list[Session]:
             windows=windows,
             is_current=(name == cur_session),
         ))
+
+    key_fn = _session_sort_key()
+    sessions.sort(key=lambda s: key_fn(s.name))
     return sessions
 
 
@@ -1912,7 +1932,7 @@ def sessions_ui(stdscr) -> None:
         # ── Help bar ──
         safe_addstr(
             stdscr, help_row, 0,
-            " 1-9:session  a-z:window  j/k:nav  n:new  del:kill  enter:switch  q:quit",
+            " 1-9:session  a-z:window  j/k:nav  n:new  o:reorder  del:kill  enter:switch  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1988,6 +2008,32 @@ def sessions_ui(stdscr) -> None:
                     switch_to_session(session_name)
                     return
             # Cancelled — restore curses
+            stdscr = curses.initscr()
+            curses.noecho()
+            curses.cbreak()
+            stdscr.keypad(True)
+            curses.curs_set(0)
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
+            curses.init_pair(3, curses.COLOR_WHITE, -1)
+            curses.init_pair(4, curses.COLOR_YELLOW, -1)
+            curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+            stdscr.timeout(1000)
+            # Refresh session list
+            all_sessions = get_sessions()
+            session_hotkeys = {}
+            for i, sess in enumerate(all_sessions):
+                if i < 9:
+                    session_hotkeys[str(i + 1)] = sess
+            if selected >= len(all_sessions):
+                selected = max(0, len(all_sessions) - 1)
+
+        elif key == ord("o"):
+            curses.endwin()
+            script = str(Path.home() / ".tmux" / "plugins" / "tmux-reorder" / "scripts" / "reorder_sessions.sh")
+            subprocess.run([script], check=False)
+            # Restore curses
             stdscr = curses.initscr()
             curses.noecho()
             curses.cbreak()
