@@ -153,6 +153,7 @@ class Worktree:
     commit_ts: int        # unix timestamp for sorting
     status: str           # "clean" | "dirty" | "prunable"
     merged: bool          # all commits reachable from main?
+    has_diffs: bool       # uncommitted changes in working tree?
 
 
 # ── tmux helpers ─────────────────────────────────────────────────
@@ -347,15 +348,14 @@ def get_worktrees(repo_root: Path | None = None) -> list[Worktree]:
             # Status
             if is_prunable:
                 status = "prunable"
+                has_diffs = False
             else:
                 r4 = subprocess.run(
                     ["git", "-C", wt_path_str, "status", "--porcelain"],
                     capture_output=True, text=True,
                 )
-                if r4.returncode == 0 and r4.stdout.strip():
-                    status = "dirty"
-                else:
-                    status = "clean"
+                has_diffs = r4.returncode == 0 and bool(r4.stdout.strip())
+                status = "dirty" if has_diffs else "clean"
 
             worktrees.append(Worktree(
                 path=wt_path,
@@ -367,6 +367,7 @@ def get_worktrees(repo_root: Path | None = None) -> list[Worktree]:
                 commit_ts=commit_ts,
                 status=status,
                 merged=merged,
+                has_diffs=has_diffs,
             ))
 
     # Sort oldest first (ascending by commit timestamp)
@@ -1507,6 +1508,7 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
 
     selected = 0
     scroll_offset = 0
+    marked: set[int] = set()
     stdscr.timeout(1000)
 
     while True:
@@ -1517,11 +1519,13 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
 
         # Column layout
         merged_col_w = 6   # "Merged"
+        diffs_col_w = 5    # "Diffs"
         commit_col_w = 17  # "Last Commit"
         gap = 2
         name_col_start = 3  # after status char + space
         merged_col_start = width - merged_col_w - 1
-        commit_col_start = merged_col_start - gap - commit_col_w
+        diffs_col_start = merged_col_start - gap - diffs_col_w
+        commit_col_start = diffs_col_start - gap - commit_col_w
         name_col_w = max(commit_col_start - gap - name_col_start, 10)
 
         # Keep selection visible
@@ -1537,6 +1541,8 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
                     curses.color_pair(1) | curses.A_BOLD)
         safe_addstr(stdscr, 0, commit_col_start, "Last Commit", commit_col_w,
                     curses.color_pair(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 0, diffs_col_start, "Diffs", diffs_col_w,
+                    curses.color_pair(1) | curses.A_BOLD)
         safe_addstr(stdscr, 0, merged_col_start, "Merged", merged_col_w,
                     curses.color_pair(1) | curses.A_BOLD)
 
@@ -1545,6 +1551,8 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
         safe_addstr(stdscr, 1, name_col_start, sep * name_col_w, name_col_w,
                     curses.color_pair(1))
         safe_addstr(stdscr, 1, commit_col_start, sep * commit_col_w, commit_col_w,
+                    curses.color_pair(1))
+        safe_addstr(stdscr, 1, diffs_col_start, sep * diffs_col_w, diffs_col_w,
                     curses.color_pair(1))
         safe_addstr(stdscr, 1, merged_col_start, sep * merged_col_w, merged_col_w,
                     curses.color_pair(1))
@@ -1558,8 +1566,10 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
             y = header_rows + row
             is_sel = (wt_idx == selected)
 
-            # Status indicator
-            if wt.status == "dirty":
+            # Status indicator / mark
+            if wt_idx in marked:
+                safe_addstr(stdscr, y, 1, "x", 1, curses.color_pair(4) | curses.A_BOLD)
+            elif wt.status == "dirty":
                 safe_addstr(stdscr, y, 1, "*", 1, curses.color_pair(4))
             elif wt.status == "prunable":
                 safe_addstr(stdscr, y, 1, "~", 1, curses.color_pair(6))
@@ -1571,6 +1581,16 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
             # Last commit
             commit_attr = curses.color_pair(2) if is_sel else curses.A_DIM
             safe_addstr(stdscr, y, commit_col_start, wt.last_commit_date, commit_col_w, commit_attr)
+
+            # Diffs
+            diffs_text = "yes" if wt.has_diffs else "no"
+            if is_sel:
+                diffs_attr = curses.color_pair(2)
+            elif wt.has_diffs:
+                diffs_attr = curses.color_pair(3) | curses.A_BOLD
+            else:
+                diffs_attr = curses.A_DIM
+            safe_addstr(stdscr, y, diffs_col_start, diffs_text, diffs_col_w, diffs_attr)
 
             # Merged
             merged_text = "yes" if wt.merged else "no"
@@ -1585,7 +1605,7 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
         # Help bar
         safe_addstr(
             stdscr, help_row, 0,
-            " j/k:nav  del:delete  c:claude  x:codex  z:zsh  q:back",
+            " j/k:nav  space:mark  del:delete  c:claude  x:codex  z:zsh  q:back",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1606,8 +1626,42 @@ def worktrees_ui(stdscr, repo_root: Path | None = None) -> None:
             if selected > 0:
                 selected -= 1
 
-        elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
+        elif key == ord(" "):
             if all_wt:
+                if selected in marked:
+                    marked.discard(selected)
+                else:
+                    marked.add(selected)
+                if selected < len(all_wt) - 1:
+                    selected += 1
+
+        elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
+            if all_wt and marked:
+                # Batch delete
+                n = len(marked)
+                dirty_count = sum(1 for i in marked if all_wt[i].has_diffs)
+                dirty_warn = f" ({dirty_count} dirty)" if dirty_count else ""
+                prompt = f" Delete {n} worktree{'s' if n != 1 else ''}{dirty_warn}? y/n"
+                safe_addstr(stdscr, help_row, 0, prompt, width,
+                            curses.color_pair(4) | curses.A_BOLD)
+                stdscr.clrtoeol()
+                stdscr.clearok(True)
+                stdscr.refresh()
+                stdscr.timeout(-1)
+                confirm_key = stdscr.getch()
+                stdscr.timeout(1000)
+                if confirm_key in (ord("y"), ord("Y")):
+                    for idx in sorted(marked, reverse=True):
+                        _delete_worktree(all_wt[idx])
+                    marked.clear()
+                    all_wt = get_worktrees(repo_root=repo_root)
+                    if not all_wt:
+                        return
+                    if selected >= len(all_wt):
+                        selected = max(0, len(all_wt) - 1)
+                    scroll_offset = 0
+            elif all_wt:
+                # Single delete
                 if _confirm_delete_worktree(stdscr, all_wt[selected], help_row, width):
                     all_wt = get_worktrees(repo_root=repo_root)
                     if not all_wt:
