@@ -44,6 +44,8 @@ DEFAULT_PATH_SEGMENTS = [
 ANSI_SGR_RE = re.compile(r"\033\[([0-9;:]*)m")
 # Match any escape sequence (SGR, cursor movement, etc.)
 ANSI_ANY_RE = re.compile(r"\033(?:\[[0-9;:]*[A-Za-z]|\][^\033]*(?:\033\\|\007))")
+# Match trailing timestamp in worktree branch names: -YYYYMMDD_HHMMSS
+WORKTREE_TS_RE = re.compile(r"-\d{8}_\d{6}$")
 
 
 def _char_width(ch: str) -> int:
@@ -140,6 +142,18 @@ class Session:
     is_current: bool
 
 
+@dataclass
+class Worktree:
+    path: Path            # worktree directory
+    repo_root: Path       # main repo root
+    branch: str           # e.g. "ai/easy-claw-20260221_165351"
+    head: str             # HEAD SHA
+    display_name: str     # "easy-claw" (no ai/ prefix, no timestamp)
+    last_commit_date: str # "3 hours ago" via git log --format=%cr
+    status: str           # "clean" | "dirty" | "prunable"
+    merged: bool          # all commits reachable from main?
+
+
 # ── tmux helpers ─────────────────────────────────────────────────
 
 
@@ -219,6 +233,130 @@ def get_sessions() -> list[Session]:
             is_current=(name == cur_session),
         ))
     return sessions
+
+
+def get_worktrees() -> list[Worktree]:
+    """Discover all git worktrees across tmux session paths."""
+    # 1. Discover repo roots from tmux sessions
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_path}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    session_paths = set(result.stdout.strip().splitlines())
+    repo_roots: set[str] = set()
+    for sp in session_paths:
+        if not sp:
+            continue
+        r = subprocess.run(
+            ["git", "-C", sp, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            repo_roots.add(r.stdout.strip())
+
+    worktrees: list[Worktree] = []
+
+    for root_str in sorted(repo_roots):
+        root = Path(root_str)
+        # 2. Parse git worktree list --porcelain
+        r = subprocess.run(
+            ["git", "-C", root_str, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            continue
+
+        # Parse porcelain output: blocks separated by blank lines
+        entries: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in r.stdout.splitlines():
+            if not line.strip():
+                if current:
+                    entries.append(current)
+                    current = {}
+            else:
+                if line.startswith("worktree "):
+                    current["worktree"] = line[9:]
+                elif line.startswith("HEAD "):
+                    current["HEAD"] = line[5:]
+                elif line.startswith("branch "):
+                    current["branch"] = line[7:]
+                elif line == "prunable":
+                    current["prunable"] = "true"
+                elif line == "detached":
+                    current["detached"] = "true"
+        if current:
+            entries.append(current)
+
+        # Skip the main worktree (first entry)
+        for entry in entries[1:]:
+            wt_path_str = entry.get("worktree", "")
+            if not wt_path_str:
+                continue
+            wt_path = Path(wt_path_str)
+            head = entry.get("HEAD", "")
+            branch = entry.get("branch", "")
+            is_prunable = "prunable" in entry
+
+            # Clean branch name
+            branch_name = branch.replace("refs/heads/", "") if branch else ""
+
+            # Display name: strip ai/ prefix and timestamp
+            display = branch_name
+            if display.startswith("ai/"):
+                display = display[3:]
+            display = WORKTREE_TS_RE.sub("", display)
+            if not display:
+                display = wt_path.name
+
+            # Last commit date
+            if head:
+                r2 = subprocess.run(
+                    ["git", "-C", root_str, "log", "-1", "--format=%cr", head],
+                    capture_output=True, text=True,
+                )
+                last_commit = r2.stdout.strip() if r2.returncode == 0 else "unknown"
+            else:
+                last_commit = "unknown"
+
+            # Merged check
+            if head:
+                r3 = subprocess.run(
+                    ["git", "-C", root_str, "merge-base", "--is-ancestor", head, "main"],
+                    capture_output=True, text=True,
+                )
+                merged = r3.returncode == 0
+            else:
+                merged = False
+
+            # Status
+            if is_prunable:
+                status = "prunable"
+            else:
+                r4 = subprocess.run(
+                    ["git", "-C", wt_path_str, "status", "--porcelain"],
+                    capture_output=True, text=True,
+                )
+                if r4.returncode == 0 and r4.stdout.strip():
+                    status = "dirty"
+                else:
+                    status = "clean"
+
+            worktrees.append(Worktree(
+                path=wt_path,
+                repo_root=root,
+                branch=branch_name,
+                head=head,
+                display_name=display,
+                last_commit_date=last_commit,
+                status=status,
+                merged=merged,
+            ))
+
+    return worktrees
 
 
 def is_ai_window(window: Window) -> bool:
@@ -1153,6 +1291,229 @@ def robots_ui(stdscr) -> None:
                 return
 
 
+# ── Worktree actions ──────────────────────────────────────────
+
+
+def _delete_worktree(wt: Worktree) -> None:
+    """Remove a worktree and delete its branch."""
+    subprocess.run(
+        ["git", "-C", str(wt.repo_root), "worktree", "remove", "--force", str(wt.path)],
+        capture_output=True, check=False,
+    )
+    if wt.branch:
+        subprocess.run(
+            ["git", "-C", str(wt.repo_root), "branch", "-D", wt.branch],
+            capture_output=True, check=False,
+        )
+
+
+def _open_agent_in_worktree(wt: Worktree, agent: str) -> None:
+    """Open a new tmux window running an AI agent in the worktree."""
+    ai_launch = str(Path.home() / ".tmux" / "scripts" / "ai-launch")
+    window_name = f"{wt.display_name} ({agent})"
+    runner_cmd = (
+        f"python3 {shlex.quote(ai_launch)}"
+        f" --agent {shlex.quote(agent)}"
+        f" --no-worktree"
+        f" --name {shlex.quote(wt.display_name)}"
+    )
+    tmux_cmd = f"bash -lc {shlex.quote(runner_cmd)}"
+    subprocess.run(
+        ["tmux", "new-window", "-n", window_name, "-c", str(wt.path), tmux_cmd],
+        capture_output=True, check=False,
+    )
+
+
+def _open_shell_in_worktree(wt: Worktree) -> None:
+    """Open a new tmux window with a shell in the worktree."""
+    subprocess.run(
+        ["tmux", "new-window", "-n", wt.display_name, "-c", str(wt.path)],
+        capture_output=True, check=False,
+    )
+
+
+def _confirm_delete_worktree(stdscr, wt: Worktree, help_row: int, width: int) -> bool:
+    """Show y/n confirmation for worktree deletion. Returns True if deleted."""
+    dirty_warn = " (DIRTY)" if wt.status == "dirty" else ""
+    prompt = f" Delete worktree '{wt.display_name}'{dirty_warn}? y/n"
+    safe_addstr(stdscr, help_row, 0, prompt, width,
+                curses.color_pair(4) | curses.A_BOLD)
+    stdscr.clrtoeol()
+    stdscr.clearok(True)
+    stdscr.refresh()
+    stdscr.timeout(-1)
+    confirm_key = stdscr.getch()
+    stdscr.timeout(1000)
+    if confirm_key not in (ord("y"), ord("Y")):
+        return False
+    _delete_worktree(wt)
+    return True
+
+
+# ── Worktrees UI ─────────────────────────────────────────────
+
+
+def worktrees_ui(stdscr) -> None:
+    """Worktree cleanup browser showing all git worktrees."""
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)       # headers
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected
+    curses.init_pair(3, curses.COLOR_WHITE, -1)      # normal
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)     # help bar / dirty
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)    # hotkey letter
+    curses.init_pair(6, curses.COLOR_RED, -1)        # prunable
+
+    all_wt = get_worktrees()
+    if not all_wt:
+        # Show empty state
+        height, width = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 1, "No worktrees found.", width - 1, curses.color_pair(3))
+        safe_addstr(stdscr, height - 1, 0, " q:back", width,
+                    curses.color_pair(4) | curses.A_DIM)
+        stdscr.refresh()
+        stdscr.timeout(-1)
+        while True:
+            key = stdscr.getch()
+            if key in (ord("q"), 27):
+                return
+
+    selected = 0
+    scroll_offset = 0
+    stdscr.timeout(1000)
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        help_row = height - 1
+        header_rows = 2  # header + separator
+        list_height = help_row - header_rows
+
+        # Column layout
+        merged_col_w = 6   # "Merged"
+        commit_col_w = 17  # "Last Commit"
+        gap = 2
+        name_col_start = 3  # after status char + space
+        merged_col_start = width - merged_col_w - 1
+        commit_col_start = merged_col_start - gap - commit_col_w
+        name_col_w = max(commit_col_start - gap - name_col_start, 10)
+
+        # Keep selection visible
+        if selected < scroll_offset:
+            scroll_offset = selected
+        if selected >= scroll_offset + list_height:
+            scroll_offset = selected - list_height + 1
+
+        stdscr.erase()
+
+        # Header row
+        safe_addstr(stdscr, 0, name_col_start, "Name", name_col_w,
+                    curses.color_pair(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 0, commit_col_start, "Last Commit", commit_col_w,
+                    curses.color_pair(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 0, merged_col_start, "Merged", merged_col_w,
+                    curses.color_pair(1) | curses.A_BOLD)
+
+        # Separator row
+        sep = "\u2500"
+        safe_addstr(stdscr, 1, name_col_start, sep * name_col_w, name_col_w,
+                    curses.color_pair(1))
+        safe_addstr(stdscr, 1, commit_col_start, sep * commit_col_w, commit_col_w,
+                    curses.color_pair(1))
+        safe_addstr(stdscr, 1, merged_col_start, sep * merged_col_w, merged_col_w,
+                    curses.color_pair(1))
+
+        # Worktree rows
+        for row in range(list_height):
+            wt_idx = scroll_offset + row
+            if wt_idx >= len(all_wt):
+                break
+            wt = all_wt[wt_idx]
+            y = header_rows + row
+            is_sel = (wt_idx == selected)
+
+            # Status indicator
+            if wt.status == "dirty":
+                safe_addstr(stdscr, y, 1, "*", 1, curses.color_pair(4))
+            elif wt.status == "prunable":
+                safe_addstr(stdscr, y, 1, "~", 1, curses.color_pair(6))
+
+            # Name
+            name_attr = curses.color_pair(2) if is_sel else curses.color_pair(3)
+            safe_addstr(stdscr, y, name_col_start, wt.display_name, name_col_w, name_attr)
+
+            # Last commit
+            commit_attr = curses.color_pair(2) if is_sel else curses.A_DIM
+            safe_addstr(stdscr, y, commit_col_start, wt.last_commit_date, commit_col_w, commit_attr)
+
+            # Merged
+            merged_text = "yes" if wt.merged else "no"
+            if is_sel:
+                merged_attr = curses.color_pair(2)
+            elif wt.merged:
+                merged_attr = curses.A_DIM
+            else:
+                merged_attr = curses.color_pair(3) | curses.A_BOLD
+            safe_addstr(stdscr, y, merged_col_start, merged_text, merged_col_w, merged_attr)
+
+        # Help bar
+        safe_addstr(
+            stdscr, help_row, 0,
+            " j/k:nav  del:delete  c:claude  x:codex  z:zsh  q:back",
+            width, curses.color_pair(4) | curses.A_DIM,
+        )
+
+        stdscr.clearok(True)
+        stdscr.refresh()
+
+        # Input
+        key = stdscr.getch()
+
+        if key == -1:
+            continue
+
+        if key in (ord("j"), curses.KEY_DOWN):
+            if selected < len(all_wt) - 1:
+                selected += 1
+
+        elif key in (ord("k"), curses.KEY_UP):
+            if selected > 0:
+                selected -= 1
+
+        elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, 127):
+            if all_wt:
+                if _confirm_delete_worktree(stdscr, all_wt[selected], help_row, width):
+                    all_wt = get_worktrees()
+                    if not all_wt:
+                        return
+                    if selected >= len(all_wt):
+                        selected = max(0, len(all_wt) - 1)
+                    scroll_offset = 0
+
+        elif key == ord("c"):
+            if all_wt:
+                _open_agent_in_worktree(all_wt[selected], "claude")
+                return
+
+        elif key == ord("x"):
+            if all_wt:
+                _open_agent_in_worktree(all_wt[selected], "codex")
+                return
+
+        elif key == ord("z"):
+            if all_wt:
+                _open_shell_in_worktree(all_wt[selected])
+                return
+
+        elif key == ord("q"):
+            return
+
+        elif key == 27:
+            alt = _read_alt_key(stdscr)
+            if alt and _handle_alt_switch(stdscr, alt, "t"):
+                return
+            return
+
+
 # ── New session creation ──────────────────────────────────────
 
 
@@ -1370,7 +1731,7 @@ def sessions_ui(stdscr) -> None:
         # ── Help bar ──
         safe_addstr(
             stdscr, help_row, 0,
-            " 1-9:session  a-z:window  j/k:nav  n:new  del:kill  enter:switch  q:quit",
+            " 1-9:session  a-z:window  j/k:nav  n:new  del:kill  t:worktrees  enter:switch  q:quit",
             width, curses.color_pair(4) | curses.A_DIM,
         )
 
@@ -1467,6 +1828,10 @@ def sessions_ui(stdscr) -> None:
             if selected >= len(all_sessions):
                 selected = max(0, len(all_sessions) - 1)
 
+        elif key == ord("t"):
+            worktrees_ui(stdscr)
+            return
+
         elif key == ord("q"):
             return
 
@@ -1525,6 +1890,10 @@ def main() -> None:
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
         preview_mode(sys.argv[2])
+        return
+
+    if "--worktrees" in sys.argv:
+        curses.wrapper(worktrees_ui)
         return
 
     if "--robots" in sys.argv:
