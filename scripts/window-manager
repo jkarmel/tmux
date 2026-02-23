@@ -1448,6 +1448,15 @@ def _delete_worktree(wt: Worktree) -> None:
         ["git", "-C", str(wt.repo_root), "worktree", "remove", "--force", str(wt.path)],
         capture_output=True, check=False,
     )
+    # git worktree remove can fail silently (prunable/locked worktrees);
+    # ensure the directory is actually gone.
+    if wt.path.exists():
+        shutil.rmtree(wt.path, ignore_errors=True)
+    # Prune stale worktree metadata so git doesn't list ghosts.
+    subprocess.run(
+        ["git", "-C", str(wt.repo_root), "worktree", "prune"],
+        capture_output=True, check=False,
+    )
     if wt.branch:
         subprocess.run(
             ["git", "-C", str(wt.repo_root), "branch", "-D", wt.branch],
