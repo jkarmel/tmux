@@ -1,0 +1,17 @@
+title: tmux AI Command Center
+description: A tmux configuration for managing AI coding agents with worktree isolation, live monitoring, and interactive workflows.
+remote_theme: just-the-docs/just-the-docs@v0.10.1
+color_scheme: dark
+
+# GitHub Pages source
+url: ""
+baseurl: ""
+
+# Exclude non-docs files from the build
+exclude:
+  - scripts/
+  - plugins/
+  - .tmux.conf
+  - .env
+  - .gitignore
+  - FEATURES.md
