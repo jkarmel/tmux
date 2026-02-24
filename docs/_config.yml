@@ -3,9 +3,12 @@ description: A tmux configuration for managing AI coding agents with worktree is
 remote_theme: just-the-docs/just-the-docs@v0.10.1
 color_scheme: dark
 
+plugins:
+  - jekyll-remote-theme
+
 # GitHub Pages source
-url: ""
-baseurl: ""
+url: "https://jkarmel.github.io"
+baseurl: "/tmux"
 
 # Exclude non-docs files from the build
 exclude:
@@ -15,3 +18,4 @@ exclude:
   - .env
   - .gitignore
   - FEATURES.md
+  - capture-screenshots.py
